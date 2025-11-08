@@ -31,6 +31,10 @@ LISTEN_SH     = str(APP_DIR / "listen.sh")
 # Parse-mode coordination with listener/parser
 MODE_FILE     = Path("/tmp/betty_parse_mode.txt")  # "SETUP" or "PLAY"
 
+# Custom games storage
+CUSTOM_GAMES_FILE = APP_DIR / "custom_games.json"
+CUSTOM_GAMES_BACKUP_DIR = APP_DIR / "backups"
+
 # USB speakers device for playback (card 3, device 0 based on your setup)
 AUDIO_DEV     = os.environ.get("AUDIO_DEV", "plughw:3,0")
 
@@ -285,6 +289,97 @@ PROGRAMS = {
     },
 }
 
+# ------------------ Custom Games Management ------------------
+def load_custom_games() -> dict:
+    """Load custom games from JSON file."""
+    try:
+        if CUSTOM_GAMES_FILE.exists():
+            with open(CUSTOM_GAMES_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def backup_custom_games():
+    """Create a backup of the current custom games file."""
+    try:
+        if not CUSTOM_GAMES_FILE.exists() or CUSTOM_GAMES_FILE.stat().st_size == 0:
+            return
+        
+        # Create backups directory if it doesn't exist
+        CUSTOM_GAMES_BACKUP_DIR.mkdir(exist_ok=True)
+        
+        # Create backup filename with timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = CUSTOM_GAMES_BACKUP_DIR / f"custom_games_{timestamp}.json"
+        
+        # Copy current file to backup
+        import shutil
+        shutil.copy2(CUSTOM_GAMES_FILE, backup_file)
+        
+        # Keep only the last 10 backups
+        backups = sorted(CUSTOM_GAMES_BACKUP_DIR.glob("custom_games_*.json"), reverse=True)
+        for old_backup in backups[10:]:
+            try:
+                old_backup.unlink()
+            except Exception:
+                pass
+        
+        return str(backup_file)
+    except Exception as e:
+        print(f"Warning: Failed to create backup: {e}")
+        return None
+
+def save_custom_games(custom_games: dict):
+    """Save custom games to JSON file with backup."""
+    try:
+        # Create backup before saving (only if file exists and has content)
+        if CUSTOM_GAMES_FILE.exists() and CUSTOM_GAMES_FILE.stat().st_size > 0:
+            backup_custom_games()
+        
+        # Save the new games
+        print(f"[DEBUG] Writing {len(custom_games)} games to {CUSTOM_GAMES_FILE}")
+        with open(CUSTOM_GAMES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(custom_games, f, indent=2, ensure_ascii=False)
+        
+        # Verify the file was written
+        if CUSTOM_GAMES_FILE.exists() and CUSTOM_GAMES_FILE.stat().st_size > 0:
+            print(f"[DEBUG] Successfully saved {len(custom_games)} games")
+            return True
+        else:
+            print(f"[DEBUG] ERROR: File was not written or is empty")
+            return False
+    except Exception as e:
+        print(f"Error saving custom games: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def get_all_programs() -> dict:
+    """Get all programs (custom games override built-in ones)."""
+    all_programs = PROGRAMS.copy()
+    custom_games = load_custom_games()
+    # Custom games override built-in ones
+    all_programs.update(custom_games)
+    return all_programs
+
+# Load custom games on startup
+CUSTOM_GAMES = load_custom_games()
+
+# Initialize default program (use first custom game if available, otherwise CLASSIC)
+default_program_key = "CLASSIC"
+default_program = PROGRAMS.get("CLASSIC", {
+    "name": "Classic Bingo",
+    "desc": "Standard line bingo",
+    "kind": "classic",
+    "params": {"free_enabled": True},
+    "preview_cells": []
+})
+if CUSTOM_GAMES:
+    default_program_key = list(CUSTOM_GAMES.keys())[0]
+    default_program = CUSTOM_GAMES[default_program_key]
+
 # ------------------ Global Game State ------------------
 GAME = {
     # Views: WELCOME -> SETUP_GAMES -> PROGRAM_PICK -> OVERVIEW/FOCUS
@@ -299,8 +394,8 @@ GAME = {
     "status": "LISTENING",
     "last_heard": "",
     # Active program
-    "program_key": "CLASSIC",
-    "program": PROGRAMS["CLASSIC"],
+    "program_key": default_program_key,
+    "program": default_program,
     "free_enabled": True,
 }
 GAME["cards"] = make_cards(GAME["sheet_n"], free_enabled=GAME["free_enabled"])
@@ -311,14 +406,19 @@ EVENT_QUEUE = queue.Queue(maxsize=256)
 # ------------------ Helpers: program & session ------------------
 def set_program_by_key(key: str, params: dict | None = None):
     key = str(key).upper()
-    if key not in PROGRAMS:
+    all_programs = get_all_programs()
+    if key not in all_programs:
         return False
-    spec = json.loads(json.dumps(PROGRAMS[key]))  # deep-ish copy
+    spec = json.loads(json.dumps(all_programs[key]))  # deep-ish copy
     if params:
         spec["params"].update(params)
     GAME["program_key"] = key
     GAME["program"] = spec
-    GAME["free_enabled"] = bool(spec.get("params", {}).get("free_enabled", True))
+    # Get free_enabled from params or directly from spec (for custom games)
+    free_enabled = spec.get("free_enabled")
+    if free_enabled is None:
+        free_enabled = spec.get("params", {}).get("free_enabled", True)
+    GAME["free_enabled"] = bool(free_enabled)
     # apply FREE on current cards
     for c in GAME["cards"]:
         c["marks"]["FREE"] = bool(GAME["free_enabled"])
@@ -365,6 +465,11 @@ def public_state():
             "kind": GAME["program"]["kind"],
             "params": GAME["program"].get("params", {}),
             "preview_cells": program_preview_cells(),
+            "patterns": GAME["program"].get("patterns", []),
+            "allowed_numbers": GAME["program"].get("allowed_numbers", []),
+            "disallowed_numbers": GAME["program"].get("disallowed_numbers", []),
+            "allowed_positions": GAME["program"].get("allowed_positions", []),
+            "disallowed_positions": GAME["program"].get("disallowed_positions", []),
         },
         "free_enabled": GAME["free_enabled"],
     }
@@ -392,7 +497,9 @@ def reset_sheet(n: int = None):
     if n is None:
         n = GAME["sheet_n"]
     GAME["sheet_n"] = max(1, min(6, int(n)))
-    GAME["cards"] = make_cards(GAME["sheet_n"], free_enabled=GAME["free_enabled"])
+    # Use free_enabled from the current program
+    free_enabled = bool(GAME.get("free_enabled", True))
+    GAME["cards"] = make_cards(GAME["sheet_n"], free_enabled=free_enabled)
     GAME["focus_idx"] = None
     GAME["status"] = "LISTENING"
     broadcast({"type": "STATE", "state": public_state()})
@@ -517,6 +624,10 @@ sock = Sock(app)
 def index():
     return render_template("index.html")
 
+@app.get("/favicon.ico")
+def favicon():
+    return "", 204  # No content
+
 # ----------- State APIs -----------
 @app.get("/api/state")
 def api_state():
@@ -524,15 +635,53 @@ def api_state():
 
 @app.post("/api/start")
 def api_start():
+    """Start a new session - clear previous game state and lineup."""
     if os.path.isfile(JINGLE_PATH):
         play_wav(JINGLE_PATH)
+    
+    # Clear previous session state
+    GAME["session_total_games"] = None
+    GAME["session_lineup"] = []
+    GAME["current_game_idx"] = 0
+    GAME["status"] = "LISTENING"
+    
+    # Clear any win state
+    WINNER.stop()
+    
     set_parse_mode("SETUP")
     set_view("SETUP_GAMES")
     try:
         say("Welcome to Betty Bot. How many games will you be playing tonight?")
     except Exception:
         pass
+    broadcast({"type": "STATE", "state": public_state()})
     return jsonify({"ok": True})
+
+@app.post("/api/winner/start")
+def api_winner_start():
+    """Start the winner audio loop (and optional victory sting)."""
+    ok = False
+
+    # Fire a one-shot sting if present
+    if os.path.isfile(VICTORY_PATH):
+        play_wav(VICTORY_PATH)
+        ok = True
+
+    # Start the continuous winner loop
+    if os.path.isfile(WINNER_LOOP_PATH):
+        WINNER.start()
+        ok = True
+
+    if ok:
+        GAME["status"] = "GOOD_BINGO"
+        broadcast({"type": "STATUS", "status": GAME["status"]})
+        return jsonify({"ok": True})
+
+    return jsonify({
+        "ok": False,
+        "error": f"Missing audio assets: VICTORY_PATH={VICTORY_PATH!r}, WINNER_LOOP_PATH={WINNER_LOOP_PATH!r}"
+    }), 404
+
 
 @app.post("/api/set_session_games")
 def api_set_session_games():
@@ -553,15 +702,19 @@ def api_set_session_games():
 # ----------- Programs / Session lineup -----------
 @app.get("/api/programs")
 def api_programs():
+    """Get all available programs (only custom games)."""
     items = []
-    for key, spec in PROGRAMS.items():
+    custom_games = load_custom_games()
+    for key, spec in custom_games.items():
         items.append({
             "key": key,
             "name": spec["name"],
             "desc": spec["desc"],
-            "kind": spec["kind"],
+            "kind": spec.get("kind", "custom"),
             "params": spec.get("params", {}),
             "preview_cells": spec.get("preview_cells", []),
+            "patterns": spec.get("patterns", []),  # Include patterns for preview animation
+            "is_custom": True,
         })
     return jsonify({
         "programs": items,
@@ -583,40 +736,53 @@ def api_programs():
 
 @app.post("/api/session/lineup")
 def api_session_lineup():
-    """
-    Body: { lineup: ["CLASSIC","HARD_WAYS",...], replace?:true }
-    If lineup shorter than total, we keep collecting via UI.
-    """
     d = request.get_json(force=True, silent=True) or {}
     lineup = d.get("lineup") or []
     if not isinstance(lineup, list):
         return jsonify({"ok": False, "error": "lineup must be a list"}), 400
+
+    all_programs = get_all_programs()          # <-- include custom_games.json
     clean = []
     for k in lineup:
         k2 = str(k).upper()
-        if k2 in PROGRAMS:
+        if k2 in all_programs:                 # <-- accept custom too
             clean.append(k2)
-    GAME["session_lineup"] = clean[: max(0, int(GAME["session_total_games"] or 0))]
+
+    total = int(GAME["session_total_games"] or 0)
+    GAME["session_lineup"] = clean[: max(0, total)]
     return jsonify({"ok": True, "session_lineup": GAME["session_lineup"], "total": GAME["session_total_games"]})
+
+
 
 @app.post("/api/session/start")
 def api_session_start():
     """
     Locks lineup and starts Game 1.
+    Fails loudly if no valid lineup or game key.
     """
     if not GAME["session_total_games"]:
-        return jsonify({"ok": False, "error": "set session games first"}), 400
+        return jsonify({"ok": False, "error": "You must set the number of games first."}), 400
+
     if not GAME["session_lineup"]:
-        # default to CLASSIC repeated if nothing chosen
-        GAME["session_lineup"] = ["CLASSIC"] * GAME["session_total_games"]
+        return jsonify({"ok": False, "error": "No game lineup detected. Please pick at least one game type."}), 400
+
     GAME["current_game_idx"] = 0
     key = GAME["session_lineup"][0]
-    set_program_by_key(key)
+
+    # Confirm this key actually exists in all programs
+    all_programs = get_all_programs()
+    if key not in all_programs:
+        return jsonify({"ok": False, "error": f"Unknown game key '{key}'. Check your lineup or custom_games.json."}), 400
+
+    if not set_program_by_key(key):
+        return jsonify({"ok": False, "error": f"Failed to activate game '{key}'."}), 500
+
     reset_sheet(GAME["sheet_n"])
     set_parse_mode("PLAY")
     set_view("OVERVIEW")
     say(f"Starting game one: {GAME['program']['name']}.")
     return jsonify({"ok": True, "state": public_state()})
+
 
 @app.post("/api/game/next")
 def api_game_next():
@@ -635,8 +801,14 @@ def api_game_next():
         say("Session complete.")
         return jsonify({"ok": True, "done": True, "state": public_state()})
     GAME["current_game_idx"] = idx
-    key = GAME["session_lineup"][idx] if idx < len(GAME["session_lineup"]) else "CLASSIC"
-    set_program_by_key(key)
+    # Get first custom game as default if lineup is empty
+    custom_games = load_custom_games()
+    default_key = list(custom_games.keys())[0] if custom_games else None
+    key = GAME["session_lineup"][idx] if idx < len(GAME["session_lineup"]) else default_key
+    if key and set_program_by_key(key):
+        pass  # Success
+    elif default_key:
+        set_program_by_key(default_key)  # Fallback to first custom game
     reset_sheet(GAME["sheet_n"])
     set_parse_mode("PLAY")
     say(f"Starting game {idx+1}: {GAME['program']['name']}.")
@@ -715,6 +887,12 @@ def api_repeat():
     return jsonify({"ok": True})
 
 # ----------- Winner control -----------
+@app.post("/api/winner/stop_audio")
+def api_winner_stop_audio():
+    """Stop the winner audio loop without advancing the game."""
+    WINNER.stop()
+    return jsonify({"ok": True})
+
 @app.post("/api/winner/stop")
 def api_winner_stop():
     WINNER.stop()
@@ -780,6 +958,207 @@ def api_speaker_set():
         return jsonify({"ok": False, "error": "Unable to set speaker volume"}), 400
     broadcast({"type": "CONFIG", "key": "speaker", "value": newv})
     return jsonify({"ok": True, "speaker": newv})
+
+# ----------- Game Editor APIs -----------
+@app.get("/api/games/editor")
+def api_games_editor():
+    """Get all games for the editor (only custom games)."""
+    custom_games = load_custom_games()
+    items = []
+    for key, spec in custom_games.items():
+        game_data = {
+            "key": key,
+            "name": spec.get("name", ""),
+            "desc": spec.get("desc", ""),
+            "kind": spec.get("kind", "custom"),
+            "is_custom": True,
+            "allowed_numbers": spec.get("allowed_numbers", []),
+            "disallowed_numbers": spec.get("disallowed_numbers", []),
+            "allowed_positions": spec.get("allowed_positions", []),
+            "disallowed_positions": spec.get("disallowed_positions", []),
+            "patterns": spec.get("patterns", []),
+            "free_enabled": spec.get("free_enabled", spec.get("params", {}).get("free_enabled", True)),
+        }
+        items.append(game_data)
+    return jsonify({"games": items})
+
+@app.get("/api/games/editor/<key>")
+def api_game_editor_get(key: str):
+    """Get a specific game for editing (only custom games)."""
+    key = str(key).upper()
+    custom_games = load_custom_games()
+    
+    if key not in custom_games:
+        return jsonify({"ok": False, "error": "Game not found"}), 404
+    
+    spec = custom_games[key]
+    
+    game_data = {
+        "key": key,
+        "name": spec.get("name", ""),
+        "desc": spec.get("desc", ""),
+        "kind": spec.get("kind", "custom"),
+        "is_custom": True,
+        "allowed_numbers": spec.get("allowed_numbers", []),
+        "disallowed_numbers": spec.get("disallowed_numbers", []),
+        "allowed_positions": spec.get("allowed_positions", []),
+        "disallowed_positions": spec.get("disallowed_positions", []),
+        "patterns": spec.get("patterns", []),
+        "free_enabled": spec.get("free_enabled", spec.get("params", {}).get("free_enabled", True)),
+    }
+    
+    return jsonify({"ok": True, "game": game_data})
+
+@app.post("/api/games/editor")
+def api_game_editor_create():
+    """Create a new game (can override built-in games)."""
+    d = request.get_json(force=True, silent=True) or {}
+    key = str(d.get("key", "")).upper().strip()
+    if not key:
+        return jsonify({"ok": False, "error": "Key is required"}), 400
+    
+    custom_games = load_custom_games()
+    if key in custom_games:
+        return jsonify({"ok": False, "error": "Game already exists. Use update instead."}), 400
+    
+    # Parse allowed_numbers and disallowed_numbers (handle both int and str)
+    def parse_number_list(nums):
+        result = []
+        for n in nums:
+            if isinstance(n, int):
+                result.append(n)
+            elif isinstance(n, str) and n.isdigit():
+                result.append(int(n))
+        return result
+    
+    game_data = {
+        "name": str(d.get("name", "")).strip(),
+        "desc": str(d.get("desc", "")).strip(),
+        "kind": "custom",
+        "allowed_numbers": parse_number_list(d.get("allowed_numbers", [])),
+        "disallowed_numbers": parse_number_list(d.get("disallowed_numbers", [])),
+        "allowed_positions": [[int(r), int(c)] for r, c in d.get("allowed_positions", []) if isinstance(r, (int, str)) and isinstance(c, (int, str))],
+        "disallowed_positions": [[int(r), int(c)] for r, c in d.get("disallowed_positions", []) if isinstance(r, (int, str)) and isinstance(c, (int, str))],
+        "patterns": d.get("patterns", []),
+        "free_enabled": bool(d.get("free_enabled", True)),
+        "params": {"free_enabled": bool(d.get("free_enabled", True))},
+        "preview_cells": [],
+    }
+    
+    custom_games[key] = game_data
+    if save_custom_games(custom_games):
+        broadcast({"type": "CONFIG", "key": "games_updated"})
+        return jsonify({"ok": True, "game": game_data})
+    else:
+        return jsonify({"ok": False, "error": "Failed to save games"}), 500
+
+@app.put("/api/games/editor/<key>")
+def api_game_editor_update(key: str):
+    """Update an existing custom game."""
+    key = str(key).upper()
+    
+    custom_games = load_custom_games()
+    
+    # If game doesn't exist in custom games, return error (must create via POST first)
+    if key not in custom_games:
+        return jsonify({"ok": False, "error": "Game not found. Create it first using 'New Game'."}), 404
+    
+    game_data = custom_games[key]
+    
+    d = request.get_json(force=True, silent=True) or {}
+    
+    # Update all fields from request (use request data if present, otherwise keep existing)
+    if "name" in d:
+        game_data["name"] = str(d["name"]).strip()
+    if "desc" in d:
+        game_data["desc"] = str(d["desc"]).strip()
+    if "allowed_numbers" in d:
+        # Handle both list and individual numbers
+        allowed_nums = d["allowed_numbers"]
+        if isinstance(allowed_nums, list):
+            game_data["allowed_numbers"] = [int(n) for n in allowed_nums if isinstance(n, (int, str)) and (isinstance(n, int) or str(n).isdigit())]
+        else:
+            game_data["allowed_numbers"] = []
+    if "disallowed_numbers" in d:
+        # Handle both list and individual numbers
+        disallowed_nums = d["disallowed_numbers"]
+        if isinstance(disallowed_nums, list):
+            game_data["disallowed_numbers"] = [int(n) for n in disallowed_nums if isinstance(n, (int, str)) and (isinstance(n, int) or str(n).isdigit())]
+        else:
+            game_data["disallowed_numbers"] = []
+    if "allowed_positions" in d:
+        game_data["allowed_positions"] = [[int(r), int(c)] for r, c in d["allowed_positions"] if isinstance(r, (int, str)) and isinstance(c, (int, str))]
+    if "disallowed_positions" in d:
+        game_data["disallowed_positions"] = [[int(r), int(c)] for r, c in d["disallowed_positions"] if isinstance(r, (int, str)) and isinstance(c, (int, str))]
+    if "patterns" in d:
+        game_data["patterns"] = d["patterns"]
+    if "free_enabled" in d:
+        game_data["free_enabled"] = bool(d["free_enabled"])
+        if "params" not in game_data:
+            game_data["params"] = {}
+        game_data["params"]["free_enabled"] = bool(d["free_enabled"])
+    
+    # Ensure all required fields exist
+    if "allowed_numbers" not in game_data:
+        game_data["allowed_numbers"] = []
+    if "disallowed_numbers" not in game_data:
+        game_data["disallowed_numbers"] = []
+    if "allowed_positions" not in game_data:
+        game_data["allowed_positions"] = []
+    if "disallowed_positions" not in game_data:
+        game_data["disallowed_positions"] = []
+    if "patterns" not in game_data:
+        game_data["patterns"] = []
+    if "free_enabled" not in game_data:
+        game_data["free_enabled"] = True
+    if "params" not in game_data:
+        game_data["params"] = {}
+    if "free_enabled" not in game_data["params"]:
+        game_data["params"]["free_enabled"] = game_data["free_enabled"]
+    
+    # Ensure kind is set to custom for saved games
+    game_data["kind"] = "custom"
+    
+    # Update the game in custom_games dict
+    custom_games[key] = game_data
+    
+    # Debug: print what we're about to save
+    print(f"[DEBUG] Saving game {key} to custom_games.json")
+    print(f"[DEBUG] custom_games dict has {len(custom_games)} games: {list(custom_games.keys())}")
+    print(f"[DEBUG] game_data keys: {list(game_data.keys())}")
+    print(f"[DEBUG] game_data allowed_numbers: {game_data.get('allowed_numbers', [])[:10]}... (showing first 10 of {len(game_data.get('allowed_numbers', []))})")
+    print(f"[DEBUG] game_data patterns count: {len(game_data.get('patterns', []))}")
+    
+    if save_custom_games(custom_games):
+        broadcast({"type": "CONFIG", "key": "games_updated"})
+        return jsonify({"ok": True, "game": game_data})
+    else:
+        return jsonify({"ok": False, "error": "Failed to save games"}), 500
+
+@app.post("/api/games/editor/save")
+def api_games_editor_save():
+    """Explicitly save all custom games to disk."""
+    custom_games = load_custom_games()
+    if save_custom_games(custom_games):
+        return jsonify({"ok": True, "message": "Games saved successfully"})
+    else:
+        return jsonify({"ok": False, "error": "Failed to save games"}), 500
+
+@app.delete("/api/games/editor/<key>")
+def api_game_editor_delete(key: str):
+    """Delete a game (removes from custom games)."""
+    key = str(key).upper()
+    
+    custom_games = load_custom_games()
+    if key not in custom_games:
+        return jsonify({"ok": False, "error": "Game not found in custom games"}), 404
+    
+    del custom_games[key]
+    if save_custom_games(custom_games):
+        broadcast({"type": "CONFIG", "key": "games_updated"})
+        return jsonify({"ok": True, "message": "Game deleted successfully"})
+    else:
+        return jsonify({"ok": False, "error": "Failed to save games"}), 500
 
 # ----------- WebSocket (push state + heard overlays) -----------
 @sock.route("/ws")

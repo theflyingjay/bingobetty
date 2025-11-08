@@ -4,7 +4,7 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
   <title>BettyBot – Bingo</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v=3">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v=5">
 </head>
 <body>
   <div class="stage">
@@ -13,9 +13,10 @@
     <section class="welcome active" id="view_welcome" aria-labelledby="welcomeTitle">
       <div>
         <div class="logo" id="welcomeTitle">BettyBot</div>
-        <button class="start-btn" id="btn_start" aria-label="Start playing Bingo">Let’s Play Bingo!</button>
+        <button class="start-btn" id="btn_start" aria-label="Start playing Bingo">Let's Play Bingo!</button>
         <div class="start-msg">Tap to begin • Voice & on-screen controls available</div>
       </div>
+      <button class="fab-gear" id="gearBtn_welcome" aria-label="Open settings">⚙️</button>
     </section>
 
     <!-- Setup: how many games -->
@@ -28,20 +29,25 @@
           <button class="btn" id="btn_yes">Yes</button>
           <button class="btn" id="btn_no">No</button>
         </div>
-        <div class="hint">You can say “Yes” or “No,” or tap a button.</div>
+        <div class="hint">You can say "Yes" or "No," or tap a button.</div>
       </div>
+      <button class="fab-gear" id="gearBtn_setup" aria-label="Open settings">⚙️</button>
     </section>
 
-    <!-- Program pick -->
+    <!-- Program pick (clean list + preview modal) -->
     <section class="program-pick" id="view_program_pick" aria-labelledby="programPickTitle">
       <div class="pick-head">
         <div class="head-title" id="programPickTitle">Pick Games</div>
-        <div class="head-sub" id="programPickSub">Game 1 of N</div>
+        <div class="head-sub" id="programPickSub">—</div>
       </div>
-      <div class="program-grid" id="programGrid" aria-label="Game types"></div>
-      <div class="pick-actions">
-        <button class="btn primary" id="btn_start_session">Start Session</button>
-      </div>
+
+      <!-- Simple prompt: What type is Game N? -->
+      <div class="program-prompt" id="programPrompt">What type is Game 1?</div>
+
+      <!-- Big list of game name buttons -->
+      <div class="program-list" id="programList" role="listbox" aria-label="Game types"></div>
+      <!-- (No Start Session button; auto-starts when lineup is complete) -->
+      <button class="fab-gear" id="gearBtn_program" aria-label="Open settings">⚙️</button>
     </section>
 
     <!-- Overview (minimal top) -->
@@ -67,6 +73,7 @@
       <div class="focus-grid-wrap">
         <div class="focus-grid" id="focusGrid" aria-label="Focused bingo card"></div>
       </div>
+      <button class="fab-gear" id="gearBtn_focus" aria-label="Open settings">⚙️</button>
     </section>
 
     <!-- Heard popup -->
@@ -107,7 +114,6 @@
         <span class="val" id="speakerVal">—</span>
       </div>
 
-      <!-- Advanced controls moved here -->
       <div class="row" role="group" aria-label="Card and call controls">
         <button class="btn" onclick="newSheet()">New Cards</button>
         <button class="btn" onclick="simulate()">Simulate Call</button>
@@ -116,11 +122,109 @@
       </div>
 
       <div class="row">
+        <button class="btn" id="btn_game_editor" onclick="openGameEditor()">Game Editor</button>
+      </div>
+
+      <div class="row">
         <button class="btn" onclick="closeDrawer()">Close</button>
       </div>
     </div>
   </aside>
 
-  <script src="{{ url_for('static', filename='app.js') }}?v=3" defer></script>
+  <!-- GAME PREVIEW MODAL -->
+  <div class="modal-backdrop" id="previewBackdrop" aria-hidden="true"></div>
+  <div class="modal" id="previewModal" role="dialog" aria-modal="true" aria-labelledby="previewTitle" aria-hidden="true">
+    <div class="modal-card" role="document">
+      <div class="modal-head">
+        <div class="modal-title" id="previewTitle">Preview</div>
+      </div>
+      <div class="modal-body">
+        <div class="preview-grid" id="previewGrid" aria-label="Animated game preview grid"></div>
+        <div class="preview-desc" id="previewDesc"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="btn_cancel_preview">Cancel</button>
+        <button class="btn primary" id="btn_save_preview">Save Game Type</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- GAME EDITOR MODAL -->
+  <div class="modal-backdrop" id="gameEditorBackdrop" aria-hidden="true"></div>
+  <div class="modal" id="gameEditorModal" role="dialog" aria-modal="true" aria-labelledby="gameEditorTitle" aria-hidden="true">
+    <div class="modal-card game-editor-card" role="document">
+      <div class="modal-head">
+        <div class="modal-title" id="gameEditorTitle">Game Editor</div>
+        <div class="modal-head-actions">
+          <button class="btn small" id="btn_save_all_games" onclick="saveAllGames()" aria-label="Save all games to disk">💾 Save</button>
+          <button class="btn small" onclick="closeGameEditor()" aria-label="Close game editor">✕</button>
+        </div>
+      </div>
+      <div class="modal-body game-editor-body">
+        <div class="game-editor-tabs">
+          <button class="tab-btn active" data-tab="list">Games List</button>
+          <button class="tab-btn" data-tab="edit">Edit Game</button>
+        </div>
+        
+        <!-- Games List Tab -->
+        <div class="tab-content active" id="tab-list">
+          <div class="game-list" id="gameList"></div>
+          <button class="btn primary" id="btn_new_game" onclick="createNewGame()">New Game</button>
+        </div>
+        
+        <!-- Edit Game Tab -->
+        <div class="tab-content" id="tab-edit">
+          <div class="editor-section">
+            <label>Game Key (ID):</label>
+            <input type="text" id="editor_key" placeholder="MY_GAME" disabled>
+          </div>
+          <div class="editor-section">
+            <label>Game Name:</label>
+            <input type="text" id="editor_name" placeholder="My Custom Game">
+          </div>
+          <div class="editor-section">
+            <label>Description:</label>
+            <textarea id="editor_desc" placeholder="Game description"></textarea>
+          </div>
+          
+          <div class="editor-section">
+            <label>Allowed Numbers (comma-separated, 1-75):</label>
+            <input type="text" id="editor_allowed_numbers" placeholder="1,2,3...">
+          </div>
+          <div class="editor-section">
+            <label>Disallowed Numbers (comma-separated, 1-75):</label>
+            <input type="text" id="editor_disallowed_numbers" placeholder="1,2,3...">
+          </div>
+          
+          <div class="editor-section">
+            <label>Free Space:</label>
+            <div class="toggle-group">
+              <button class="btn toggle-btn" id="editor_free_enabled" onclick="toggleFreeSpace()">
+                <span id="free_space_status">Enabled</span>
+              </button>
+            </div>
+          </div>
+          
+          <div class="editor-section">
+            <label>Winning Patterns:</label>
+            <div class="patterns-preview-container">
+              <div class="patterns-preview-label">Pattern Preview (Animated)</div>
+              <div class="patterns-preview-grid" id="patternsPreviewGrid"></div>
+            </div>
+            <div id="patterns_list"></div>
+            <button class="btn" onclick="addPattern()">Add Pattern</button>
+          </div>
+          
+          <div class="editor-actions">
+            <button class="btn" onclick="cancelEdit()">Cancel</button>
+            <button class="btn primary" onclick="saveGame()">Save Game</button>
+            <button class="btn danger" id="btn_delete_game" onclick="deleteGame()" style="display:none;">Delete</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}?v=5" defer></script>
 </body>
 </html>
