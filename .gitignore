@@ -1,0 +1,19 @@
+cat > .gitignore <<'EOF'
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+*.sqlite3
+*.db
+*.wav
+*.mp3
+venv/
+.venv/
+env/
+ENV/
+.DS_Store
+tmp/
+*.json
+*.bin
+whisper.cpp/models/
+EOF

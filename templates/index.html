@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>BettyBot – Bingo</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v=3">
+</head>
+<body>
+  <div class="stage">
+
+    <!-- Welcome -->
+    <section class="welcome active" id="view_welcome" aria-labelledby="welcomeTitle">
+      <div>
+        <div class="logo" id="welcomeTitle">BettyBot</div>
+        <button class="start-btn" id="btn_start" aria-label="Start playing Bingo">Let’s Play Bingo!</button>
+        <div class="start-msg">Tap to begin • Voice & on-screen controls available</div>
+      </div>
+    </section>
+
+    <!-- Setup: how many games -->
+    <section class="setup" id="view_setup" aria-labelledby="setupTitle">
+      <div class="title" id="setupTitle">How many games will you be playing tonight?</div>
+      <div class="numgrid" id="numgrid" role="group" aria-label="Choose number of games 1 to 20"></div>
+      <div class="confirm" id="confirm" style="display:none;">
+        <div id="confirmText" aria-live="polite"></div>
+        <div class="pill" role="group" aria-label="Confirm choice">
+          <button class="btn" id="btn_yes">Yes</button>
+          <button class="btn" id="btn_no">No</button>
+        </div>
+        <div class="hint">You can say “Yes” or “No,” or tap a button.</div>
+      </div>
+    </section>
+
+    <!-- Program pick -->
+    <section class="program-pick" id="view_program_pick" aria-labelledby="programPickTitle">
+      <div class="pick-head">
+        <div class="head-title" id="programPickTitle">Pick Games</div>
+        <div class="head-sub" id="programPickSub">Game 1 of N</div>
+      </div>
+      <div class="program-grid" id="programGrid" aria-label="Game types"></div>
+      <div class="pick-actions">
+        <button class="btn primary" id="btn_start_session">Start Session</button>
+      </div>
+    </section>
+
+    <!-- Overview (minimal top) -->
+    <section class="overview" id="view_overview" aria-labelledby="overviewTitle">
+      <div class="toolbar minimal">
+        <div class="grow">
+          <span id="program_name" class="prog-name"></span>
+          <span id="status" class="status-label" aria-live="polite">LISTENING</span>
+        </div>
+        <button class="btn next big" id="btn_next_game">Game Ended → Next</button>
+        <button class="fab-gear" id="gearBtn" aria-label="Open settings">⚙️</button>
+      </div>
+      <div class="cards cols-3" id="cards" aria-label="Bingo cards"></div>
+    </section>
+
+    <!-- Focus -->
+    <section class="focus" id="view_focus" aria-labelledby="focusTitle">
+      <div class="focus-head">
+        <button class="back" id="btn_back" aria-label="Back to all cards">← Back</button>
+        <div class="focus-title" id="focusTitle">Sheet · Card 1</div>
+        <div class="status">Status: <span id="status_focus" aria-live="polite">LISTENING</span></div>
+      </div>
+      <div class="focus-grid-wrap">
+        <div class="focus-grid" id="focusGrid" aria-label="Focused bingo card"></div>
+      </div>
+    </section>
+
+    <!-- Heard popup -->
+    <div class="heard-overlay" id="heardOverlay" aria-live="polite" aria-modal="true" role="dialog">
+      <div class="heard-box" role="document">
+        <div class="heard-title">Heard</div>
+        <div class="heard-text" id="heardText">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Drawer -->
+  <div class="drawer-backdrop" id="drawerBackdrop" aria-hidden="true"></div>
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-label="Settings Drawer">
+    <div class="controls">
+      <div class="row">
+        <div style="font-weight:800;">Settings</div>
+        <div class="status">Status: <span id="status_drawer" aria-live="polite">LISTENING</span></div>
+      </div>
+
+      <!-- Mic Gain -->
+      <div class="row gain">
+        <label for="gainSlider">Mic Gain</label>
+        <button class="btn" onclick="bumpGain(-0.2)" aria-label="Decrease mic gain">−</button>
+        <input id="gainSlider" type="range" min="0.5" max="6.0" step="0.1"
+               oninput="gainLive(this.value)" onchange="gainSet(this.value)"/>
+        <button class="btn" onclick="bumpGain(0.2)" aria-label="Increase mic gain">+</button>
+        <span class="val" id="gainVal">3.0</span>
+      </div>
+
+      <!-- Speaker Volume -->
+      <div class="row speaker">
+        <label for="speakerSlider">Speaker</label>
+        <button class="btn" onclick="bumpSpeaker(-5)" aria-label="Decrease speaker volume">−</button>
+        <input id="speakerSlider" type="range" min="0" max="100" step="1"
+               oninput="speakerLive(this.value)" onchange="speakerSet(this.value)"/>
+        <button class="btn" onclick="bumpSpeaker(5)" aria-label="Increase speaker volume">+</button>
+        <span class="val" id="speakerVal">—</span>
+      </div>
+
+      <!-- Advanced controls moved here -->
+      <div class="row" role="group" aria-label="Card and call controls">
+        <button class="btn" onclick="newSheet()">New Cards</button>
+        <button class="btn" onclick="simulate()">Simulate Call</button>
+        <button class="btn" onclick="repeatLast()">Repeat</button>
+        <button class="btn" id="modeBtn_drawer" aria-pressed="false" onclick="toggleMode()">Mode: Play</button>
+      </div>
+
+      <div class="row">
+        <button class="btn" onclick="closeDrawer()">Close</button>
+      </div>
+    </div>
+  </aside>
+
+  <script src="{{ url_for('static', filename='app.js') }}?v=3" defer></script>
+</body>
+</html>

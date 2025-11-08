@@ -1,0 +1,250 @@
+/* ========== Theme Tokens ========== */
+:root{
+  --bg:#0b0e14;            /* app background */
+  --ink:#eaf2ff;           /* primary text */
+  --panel:#0f1420;         /* surfaces / panels */
+  --border:#253047;        /* panel borders */
+  --accent:#9acbff;        /* UI accents */
+  --green:#16a34a;         /* start / confirm */
+  --muted:#9aa7ba;         /* subtle text */
+}
+
+/* ========== Resets + Base ========== */
+*{ box-sizing: border-box; -webkit-user-select:none; user-select:none; }
+html,body{ margin:0; padding:0; height:100%; background:var(--bg); color:var(--ink);
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+button{ font-family: inherit; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+img{ max-width:100%; height:auto; display:block; }
+
+/* Utility */
+.hidden{ display:none !important; }
+.visually-hidden{ position:absolute !important; width:1px; height:1px; margin:-1px; padding:0; border:0; clip:rect(0 0 0 0); overflow:hidden; }
+
+/* ========== Global Header / Back ========== */
+.global-header{
+  position: fixed; top:10px; left:10px; z-index:100;
+}
+.btn-back{
+  background:#1a2233; border:1px solid #2b3950; color:#9acbff;
+  padding:10px 14px; border-radius:12px; font-weight:700; font-size:16px;
+  box-shadow:0 4px 12px rgba(0,0,0,0.3);
+}
+.btn-back:active{ transform: translateY(1px); }
+
+/* ========== App Stage / Views ========== */
+.stage{ position:fixed; inset:0; display:flex; flex-direction:column; }
+.welcome,.setup,.overview,.focus{ flex:1; display:none; }
+.active{ display:flex; }
+
+/* ========== Welcome (5" touch optimized) ========== */
+.welcome{
+  align-items:center; justify-content:center; padding:16px; text-align:center;
+}
+.logo{
+  font-size:clamp(28px,6.5vw,42px); font-weight:900; letter-spacing:1px;
+  margin-bottom:14px; color:var(--accent);
+}
+.start-btn{
+  background:var(--green); color:#fff; border:none;
+  padding:clamp(18px,4vh,26px) clamp(22px,6vw,34px);
+  font-size:clamp(22px,6vw,32px); font-weight:900; border-radius:18px;
+  min-width:72vw; min-height:12vh;
+  box-shadow:0 8px 30px rgba(0,0,0,0.35);
+  animation:pulse 1200ms ease-in-out infinite;
+}
+.start-msg{ margin-top:10px; font-size:clamp(14px,3.5vw,16px); opacity:.8; }
+@keyframes pulse{ 0%{transform:scale(1)} 50%{transform:scale(1.04)} 100%{transform:scale(1)} }
+
+/* ========== Setup (How many games?) ========== */
+.setup{ flex-direction:column; padding:18px; gap:16px; }
+.setup .title{ font-size:28px; font-weight:800; text-align:center; }
+.numgrid{
+  display:grid; grid-template-columns:repeat(5,1fr); gap:10px;
+  margin:6px auto 0; width:min(680px,92vw);
+}
+.numgrid button{
+  background:#1a2233; color:#eaf2ff; border:1px solid #2b3950; border-radius:12px;
+  padding:14px 0; font-size:20px; font-weight:800;
+}
+.confirm{ text-align:center; margin-top:8px; font-size:18px; }
+.confirm .pill{ display:inline-flex; gap:10px; margin-top:8px; }
+.pill .btn{ background:#111827; border:1px solid #334155; padding:10px 14px; border-radius:999px; font-weight:700; }
+.hint{ text-align:center; opacity:.75; margin-top:6px; font-size:14px; }
+
+/* ========== Overview (multi-card) ========== */
+.overview{ flex-direction:column; min-height:0; }
+.toolbar{
+  display:flex; gap:8px; align-items:center; padding:10px;
+  border-bottom:1px solid var(--border); background:var(--panel);
+}
+.toolbar .btn{
+  background:#1a2233; border:1px solid #2b3950; color:#eaf;
+  padding:10px 12px; border-radius:12px;
+}
+.toolbar .btn:active{ transform:translateY(1px); }
+.grow{ margin-left:auto; color:#9acbff; font-size:14px; }
+
+.cards{
+  flex:1; min-height:0; padding:10px; display:grid; gap:10px;
+}
+.cards.cols-1{ grid-template-columns:repeat(1,1fr); }
+.cards.cols-2{ grid-template-columns:repeat(2,1fr); }
+.cards.cols-3{ grid-template-columns:repeat(3,1fr); }
+.cards.cols-4{ grid-template-columns:repeat(3,1fr); }
+.cards.cols-5,.cards.cols-6{ grid-template-columns:repeat(3,1fr); }
+
+.mini{
+  background:#0b1324; border:1px solid #2b3950; border-radius:14px;
+  padding:10px; display:flex; flex-direction:column;
+}
+.mini h4{ margin:0 0 6px 0; font-size:14px; color:#9acbff; }
+.mini .grid{ display:grid; grid-template-columns:repeat(5,1fr); gap:6px; }
+.tap{ margin-top:8px; font-size:12px; opacity:.7; }
+
+/* Cells */
+.cell{
+  background:#111827; border:1px solid #293241; border-radius:10px;
+  min-height:48px; display:flex; align-items:center; justify-content:center;
+  font-size:18px;
+}
+.hdr{ font-weight:900; font-size:18px; background:#161f2f; color:#9acbff; }
+.cell.free{ color:#0f0; border-color:#365a36; }
+.cell.marked{
+  background:#284a2b; border-color:#5fa463; color:#eaffea;
+  box-shadow: inset 0 0 0 3px #6fd97a66;
+}
+
+/* ========== Focus (single card fullscreen) ========== */
+.focus{ flex-direction:column; min-height:0; }
+.focus-head{
+  display:flex; align-items:center; gap:10px; padding:10px;
+  border-bottom:1px solid var(--border); background:#0f1420;
+}
+.back{
+  background:#1a2233; border:1px solid #2b3950; color:#eaf;
+  padding:10px 12px; border-radius:12px;
+}
+.focus-title{ font-weight:800; }
+.focus-grid-wrap{ flex:1; min-height:0; display:flex; align-items:center; justify-content:center; padding:10px; }
+.focus-grid{ width:min(92vw,680px); display:grid; grid-template-columns:repeat(5,1fr); gap:8px; }
+.focus-grid .cell{ min-height:10.6vh; font-size:3.6vh; }
+
+/* ========== Heard overlay ========== */
+.heard-overlay{
+  position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+  background:rgba(0,0,0,0.55); z-index:20;
+}
+.heard-overlay.show{ display:flex; animation:fadeIn 120ms ease-out; }
+.heard-box{
+  max-width:90vw; padding:18px 26px; background:#0f1420;
+  border:2px solid #2b3950; border-radius:16px; box-shadow:0 8px 40px rgba(0,0,0,0.45);
+  color:#eaf2ff; text-align:center;
+}
+.heard-title{ font-size:18px; color:#9acbff; margin-bottom:6px; opacity:.9; }
+.heard-text{ font-size:42px; font-weight:800; letter-spacing:1px; }
+@keyframes fadeIn{ from{opacity:0} to{opacity:1} }
+
+/* ========== Drawer / Settings ========== */
+.drawer-backdrop{
+  position:fixed; inset:0; background:rgba(0,0,0,0.45);
+  opacity:0; pointer-events:none; transition:opacity .18s ease; z-index:30;
+}
+.drawer{
+  position:fixed; top:0; right:0; height:100vh; width:320px; max-width:90vw;
+  background:var(--panel); border-left:1px solid var(--border);
+  transform:translateX(100%); transition:transform .22s cubic-bezier(.2,.9,.2,1);
+  z-index:31; display:flex; flex-direction:column;
+}
+.drawer.open{ transform:translateX(0); }
+.drawer-backdrop.show{ opacity:1; pointer-events:auto; }
+
+.controls{ display:flex; flex-direction:column; gap:10px; padding:12px; }
+.row{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.btn{
+  background:#1a2233; border:1px solid #2b3950; color:#eaf;
+  padding:10px 12px; border-radius:12px; font-size:16px;
+}
+.btn:active{ transform:translateY(1px); }
+.status{ margin-left:auto; font-size:18px; color:#9fd; }
+
+/* Mic Gain row */
+.gain{
+  display:flex; align-items:center; gap:8px;
+  background:#121a2a; border:1px solid #2b3950; padding:8px 10px; border-radius:12px;
+}
+.gain label{ font-size:14px; color:#9acbff; }
+.gain .val{ width:3.2em; text-align:right; font-variant-numeric: tabular-nums; }
+
+/* Speaker row */
+.row.speaker{
+  display:flex; gap:8px; align-items:center;
+  background:#121a2a; border:1px solid #2b3950; padding:8px 10px; border-radius:12px;
+}
+.row.speaker label{ font-size:14px; color:#9acbff; }
+.row .val{ width:3.6em; text-align:right; font-variant-numeric: tabular-nums; }
+
+/* Range inputs */
+input[type=range]{ width:180px; height:28px; }
+
+/* ========== Floating Gear (open settings) ========== */
+.fab-gear{
+  position:fixed; right:12px; bottom:12px; z-index:50;
+  background:#1a2233; border:1px solid #2b3950; color:#9acbff;
+  width:56px; height:56px; border-radius:999px; font-size:24px;
+  display:grid; place-items:center; box-shadow:0 6px 22px rgba(0,0,0,0.35);
+}
+.fab-gear:active{ transform:translateY(1px); }
+
+/* ========== Misc touch niceties ========== */
+@media (hover:none){
+  .btn, .start-btn, .back, .btn-back, .fab-gear{ -webkit-tap-highlight-color: transparent; }
+}
+
+/* Optional: scroll behavior if content overflows small screens */
+@supports (overflow: overlay){
+  .drawer{ overflow-y:auto; }
+}
+
+/* =====================================================
+   ADDITIONS for Program Pick + Minimal Toolbar
+   (Everything above is your original; nothing removed)
+   ===================================================== */
+
+/* Program pick */
+.program-pick{ flex-direction:column; padding:12px; gap:12px; display:none; }
+.program-pick.active{ display:flex; }
+.pick-head{ display:flex; align-items:baseline; gap:10px; }
+.head-title{ font-weight:900; font-size:22px; }
+.head-sub{ color:var(--muted); }
+.program-grid{ display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+@media(min-width:720px){ .program-grid{ grid-template-columns:repeat(3,1fr);} }
+.program-card{
+  background:#0b1324; border:1px solid #2b3950; border-radius:14px; padding:12px;
+  display:flex; flex-direction:column; gap:8px;
+}
+.program-card .name{ font-weight:800; }
+.program-card .desc{ color:var(--muted); font-size:14px; }
+.program-card .preview{ display:grid; grid-template-columns:repeat(5, 18px); gap:4px; }
+.program-card .dot{ width:18px; height:18px; border:1px solid #293241; border-radius:4px; }
+.program-card .dot.sel{ background:#244466; border-color:#6aa2ff; }
+.program-card .choose{ margin-top:6px; }
+.pick-actions{ display:flex; justify-content:flex-end; }
+.btn.primary{ background:#1a2233; border:2px solid #2b3950; color:#eaf; font-weight:900; border-radius:12px; padding:10px 14px; }
+
+/* Minimal toolbar variant used during play */
+.toolbar.minimal{
+  display:flex; gap:8px; align-items:center; padding:10px;
+  border-bottom:1px solid var(--border); background:var(--panel);
+}
+.prog-name{ font-weight:800; margin-right:10px; }
+.status-label{ color:#9acbff; margin-left:8px; }
+.btn.next.big{
+  background:#1a2233; border:2px solid #2b3950; color:#eaf; font-weight:900;
+  padding:12px 16px; border-radius:14px;
+}
+
+/* In minimal toolbar we place the gear inline */
+.toolbar.minimal .fab-gear{
+  position:static; width:44px; height:44px; border-radius:12px; font-size:20px;
+  box-shadow:none; margin-left:6px;
+}

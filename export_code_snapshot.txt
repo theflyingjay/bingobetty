@@ -1,0 +1,2579 @@
+# Code Snapshot
+# Root: /opt/bettybot
+# Generated: 2025-11-07T22:34:44
+
+
+=== FILE: bingo_app.py ===
+```python
+#!/usr/bin/env python3
+# /opt/bettybot/bingo_app.py
+import os
+import re
+import json
+import random
+import threading
+import time
+import queue
+import subprocess
+import atexit
+from pathlib import Path
+from shutil import which as shutil_which
+
+from flask import Flask, jsonify, request, render_template
+from flask_sock import Sock
+
+# ------------------ Paths & Config ------------------
+PORT          = int(os.environ.get("PORT", "5000"))
+
+# Mic input hint for listen.sh (ALSA capture device)
+DEVICE_HINT   = os.environ.get("ALSA_DEV", "plughw:2,0")
+
+# whisper.cpp binaries / model (used by listen.sh)
+WHISPER_BIN   = os.environ.get("WHISPER_BIN", "/opt/bettybot/whisper.cpp/build/bin/whisper-cli")
+MODEL_PATH    = os.environ.get("WHISPER_MODEL", "/opt/bettybot/whisper.cpp/models/ggml-tiny.en.bin")
+
+APP_DIR       = Path(__file__).resolve().parent
+LISTEN_SH     = str(APP_DIR / "listen.sh")
+
+# Parse-mode coordination with listener/parser
+MODE_FILE     = Path("/tmp/betty_parse_mode.txt")  # "SETUP" or "PLAY"
+
+# USB speakers device for playback (card 3, device 0 based on your setup)
+AUDIO_DEV     = os.environ.get("AUDIO_DEV", "plughw:3,0")
+
+# ALSA mixer card for speaker volume control (your USB speakers are card 3)
+SPEAKER_CARD  = int(os.environ.get("SPEAKER_CARD", "3"))
+
+# Sounds
+JINGLE_PATH   = os.environ.get("JINGLE_PATH", "/opt/bettybot/snd/jingle.wav")
+VICTORY_PATH  = os.environ.get("VICTORY_PATH", "/opt/bettybot/snd/victory.wav")
+WINNER_LOOP_PATH = os.environ.get("WINNER_LOOP_PATH", "/opt/bettybot/snd/winner.wav")
+
+# Gain persistence for mic pipeline (applied in listen.sh)
+GAIN_FILE     = Path("/tmp/betty_gain.txt")
+DEFAULT_GAIN  = float(os.environ.get("GAIN", "3.0"))
+try:
+    if not GAIN_FILE.exists():
+        GAIN_FILE.write_text(f"{DEFAULT_GAIN:.2f}")
+except Exception:
+    pass
+
+def read_gain():
+    try:
+        return max(0.5, min(6.0, float(GAIN_FILE.read_text().strip())))
+    except Exception:
+        return DEFAULT_GAIN
+
+# ------------------ Output Audio Helpers (speaker) ------------------
+def play_wav(path: str):
+    """Play a WAV file via the USB speakers, quietly and non-blocking."""
+    try:
+        if os.path.isfile(path):
+            subprocess.Popen(
+                ["aplay", "-q", "-D", AUDIO_DEV, path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+    except Exception:
+        pass
+
+def say(text: str):
+    """Prefer pico2wave → aplay, fall back to espeak (slower, clearer for seniors)."""
+    text = str(text or "").strip()
+    if not text:
+        return
+    try:
+        if shutil_which("pico2wave") and shutil_which("aplay"):
+            wav = "/tmp/betty_say.wav"
+            subprocess.run(["pico2wave", "-w", wav, "-l", "en-US", text],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["aplay", "-q", "-D", AUDIO_DEV, wav],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        if shutil_which("espeak") and shutil_which("aplay"):
+            wav = "/tmp/betty_say.wav"
+            subprocess.run(["espeak", "-s", "150", "-v", "en-us+f3", "-w", wav, text],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["aplay", "-q", "-D", AUDIO_DEV, wav],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        if shutil_which("espeak"):
+            subprocess.Popen(["espeak", "-s", "150", "-v", "en-us+f3", text],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+# ------------------ Speaker Volume Helpers ------------------
+def _amixer_get_percent(card: int, ctl_candidates=("PCM","Speaker","Master")) -> int:
+    """Return current volume % for first working control on given card, else -1."""
+    for ctl in ctl_candidates:
+        try:
+            out = subprocess.check_output(
+                ["amixer", "-c", str(card), "get", ctl],
+                text=True, stderr=subprocess.STDOUT
+            )
+            m = re.search(r"\[(\d+)%\]", out)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            continue
+    return -1
+
+def _amixer_set_percent(card: int, pct: int, ctl_candidates=("PCM","Speaker","Master")) -> bool:
+    """Set volume % for first control that works."""
+    pct = max(0, min(100, int(pct)))
+    for ctl in ctl_candidates:
+        try:
+            subprocess.run(
+                ["amixer", "-c", str(card), "sset", ctl, f"{pct}%"],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return True
+        except Exception:
+            continue
+    return False
+
+def get_speaker_volume() -> int:
+    return _amixer_get_percent(SPEAKER_CARD)
+
+def set_speaker_volume(pct: int) -> int:
+    ok = _amixer_set_percent(SPEAKER_CARD, pct)
+    return get_speaker_volume() if ok else -1
+
+# ------------------ Cards / Game State ------------------
+LETTER_RANGES = {
+    "B": range(1, 16),
+    "I": range(16, 31),
+    "N": range(31, 46),
+    "G": range(46, 61),
+    "O": range(61, 76),
+}
+
+def new_card(free_enabled=True):
+    cols = {}
+    for L in "BINGO":
+        nums = random.sample(list(LETTER_RANGES[L]), 5)
+        cols[L] = nums
+    cols["N"][2] = 0  # FREE center sentinel
+    marks = {f"{L}{n}": False for L in "BINGO" for n in cols[L] if n != 0}
+    marks["FREE"] = bool(free_enabled)
+    return {"cols": cols, "marks": marks, "calls": []}
+
+def make_cards(n: int, free_enabled=True):
+    n = max(1, min(6, int(n)))
+    return [new_card(free_enabled=free_enabled) for _ in range(n)]
+
+def mark_call_on_card(card: dict, letter: str, number: int):
+    key = f"{letter}{number}"
+    card["calls"].append(key)
+    if number in card["cols"][letter]:
+        if number == 0:
+            card["marks"]["FREE"] = True
+        else:
+            card["marks"][key] = True
+
+# ------------------ Winner loop (loop winner.wav until confirm) ------------------
+class WinnerLooper:
+    def __init__(self, wav_path: str):
+        self.wav = wav_path
+        self._stop = threading.Event()
+        self._thr = None
+
+    def start(self):
+        self.stop()
+        if not os.path.isfile(self.wav):
+            return
+        self._stop.clear()
+        self._thr = threading.Thread(target=self._run, daemon=True)
+        self._thr.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                p = subprocess.Popen(["aplay", "-q", "-D", AUDIO_DEV, self.wav],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                while p.poll() is None and not self._stop.is_set():
+                    time.sleep(0.1)
+                if self._stop.is_set():
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                break
+
+    def stop(self):
+        self._stop.set()
+
+WINNER = WinnerLooper(WINNER_LOOP_PATH)
+
+# ------------------ Game programs (simple set for now) ------------------
+PROGRAMS = {
+    "CLASSIC": {
+        "name": "Classic Bingo",
+        "desc": "Standard line bingo. Free space is on.",
+        "kind": "classic",
+        "params": {"free_enabled": True},
+        "preview_cells": []
+    },
+    "HARD_WAYS": {
+        "name": "Hard Ways Bingo",
+        "desc": "Line bingo with no free space.",
+        "kind": "classic",
+        "params": {"free_enabled": False},
+        "preview_cells": []
+    },
+    "LUCKY_7": {
+        "name": "Lucky 7",
+        "desc": "Top row plus diagonal down-left from top-right.",
+        "kind": "fixed_shape",
+        "params": {},
+        "preview_cells": [[0,0],[0,1],[0,2],[0,3],[0,4],[1,3],[2,2],[3,1],[4,0]]
+    },
+    "SPECIAL_NUMBER": {
+        "name": "Special Number",
+        "desc": "After first ball, pre-mark numbers containing its digits; then coverall.",
+        "kind": "special_number",
+        "params": {"digits": []},
+        "preview_cells": []
+    },
+    "ODD_EVEN": {
+        "name": "Odds/Evens",
+        "desc": "If first ball is odd, pre-mark odds (or evens if even). Then coverall with the opposite.",
+        "kind": "odd_even",
+        "params": {"first": None},
+        "preview_cells": []
+    },
+    "GIANT_X": {
+        "name": "Giant X",
+        "desc": "Both diagonals.",
+        "kind": "fixed_shape",
+        "params": {},
+        "preview_cells": [[i,i] for i in range(5)] + [[i,4-i] for i in range(5)]
+    },
+    "BARBELL": {
+        "name": "Barbell",
+        "desc": "Two 3×3 blocks at the top corners with a bar across the middle.",
+        "kind": "fixed_shape",
+        "params": {},
+        "preview_cells": (
+            [[r,c] for r in range(0,3) for c in range(0,3)] +
+            [[r,c] for r in range(0,3) for c in range(2,5)] +
+            [[2,c] for c in range(5)]
+        )
+    },
+    "FIVE_AROUND_CORNER": {
+        "name": "Five Around the Corner",
+        "desc": "Five around a chosen corner (default top-left).",
+        "kind": "fixed_shape",
+        "params": {"corner": "TL"},
+        "preview_cells": [[0,0],[0,1],[0,2],[1,0],[2,0]]
+    },
+    "LUCKY_4": {
+        "name": "Lucky 4",
+        "desc": "Number four: middle row and right column.",
+        "kind": "fixed_shape",
+        "params": {},
+        "preview_cells": [[2,c] for c in range(5)] + [[r,4] for r in range(5)]
+    },
+    "SIX_PACK": {
+        "name": "Six Pack",
+        "desc": "A 2×3 block in the center.",
+        "kind": "fixed_shape",
+        "params": {"orientation": "2x3_center"},
+        "preview_cells": [[1,2],[2,2],[3,2],[1,3],[2,3],[3,3]]
+    },
+    "NINE_PACK": {
+        "name": "Nine Pack",
+        "desc": "A 3×3 block in the center.",
+        "kind": "fixed_shape",
+        "params": {"where": "center"},
+        "preview_cells": [[r,c] for r in range(1,4) for c in range(1,4)]
+    },
+}
+
+# ------------------ Global Game State ------------------
+GAME = {
+    # Views: WELCOME -> SETUP_GAMES -> PROGRAM_PICK -> OVERVIEW/FOCUS
+    "view": "WELCOME",
+    "session_total_games": None,                 # 1..20
+    "session_lineup": [],                        # list of program keys (length = total)
+    "current_game_idx": 0,                       # 0-based index into lineup
+    "sheet_n": int(os.environ.get("SHEET_CARDS", "3")),  # 1..6
+    "cards": [],
+    "focus_idx": None,
+    "mode": "PLAY",
+    "status": "LISTENING",
+    "last_heard": "",
+    # Active program
+    "program_key": "CLASSIC",
+    "program": PROGRAMS["CLASSIC"],
+    "free_enabled": True,
+}
+GAME["cards"] = make_cards(GAME["sheet_n"], free_enabled=GAME["free_enabled"])
+
+WS_CLIENTS = set()
+EVENT_QUEUE = queue.Queue(maxsize=256)
+
+# ------------------ Helpers: program & session ------------------
+def set_program_by_key(key: str, params: dict | None = None):
+    key = str(key).upper()
+    if key not in PROGRAMS:
+        return False
+    spec = json.loads(json.dumps(PROGRAMS[key]))  # deep-ish copy
+    if params:
+        spec["params"].update(params)
+    GAME["program_key"] = key
+    GAME["program"] = spec
+    GAME["free_enabled"] = bool(spec.get("params", {}).get("free_enabled", True))
+    # apply FREE on current cards
+    for c in GAME["cards"]:
+        c["marks"]["FREE"] = bool(GAME["free_enabled"])
+    broadcast({"type": "CONFIG", "key": "program", "value": public_state()["program"]})
+    broadcast({"type": "STATE", "state": public_state()})
+    return True
+
+def program_preview_cells():
+    p = GAME["program"]
+    cells = p.get("preview_cells", []) or []
+    if GAME["program_key"] == "FIVE_AROUND_CORNER":
+        corner = (p.get("params", {}) or {}).get("corner", "TL")
+        if corner == "TL": return [[0,0],[0,1],[0,2],[1,0],[2,0]]
+        if corner == "TR": return [[0,4],[0,3],[0,2],[1,4],[2,4]]
+        if corner == "BL": return [[4,0],[3,0],[2,0],[4,1],[4,2]]
+        if corner == "BR": return [[4,4],[3,4],[2,4],[4,3],[4,2]]
+    return cells
+
+def public_state():
+    export_cards = []
+    for c in GAME["cards"]:
+        export_cards.append({
+            "cols": c["cols"],
+            "marks": c["marks"],
+            "calls": c["calls"][-12:]
+        })
+    return {
+        "view": GAME["view"],
+        "session_total_games": GAME["session_total_games"],
+        "session_lineup": GAME["session_lineup"],
+        "current_game_idx": GAME["current_game_idx"],
+        "sheet_n": GAME["sheet_n"],
+        "cards": export_cards,
+        "focus_idx": GAME["focus_idx"],
+        "gain": read_gain(),
+        "speaker": get_speaker_volume(),
+        "mode": GAME["mode"],
+        "status": GAME["status"],
+        "last_heard": GAME["last_heard"],
+        "program": {
+            "key": GAME["program_key"],
+            "name": GAME["program"]["name"],
+            "desc": GAME["program"]["desc"],
+            "kind": GAME["program"]["kind"],
+            "params": GAME["program"].get("params", {}),
+            "preview_cells": program_preview_cells(),
+        },
+        "free_enabled": GAME["free_enabled"],
+    }
+
+def broadcast(msg: dict):
+    dead = []
+    for ws in list(WS_CLIENTS):
+        try:
+            ws.send(json.dumps(msg))
+        except Exception:
+            dead.append(ws)
+    for d in dead:
+        WS_CLIENTS.discard(d)
+
+def set_mode(mode: str):
+    GAME["mode"] = "DEBUG" if str(mode).upper() == "DEBUG" else "PLAY"
+    broadcast({"type": "MODE", "mode": GAME["mode"]})
+    broadcast({"type": "STATE", "state": public_state()})
+
+def set_view(v: str):
+    GAME["view"] = v
+    broadcast({"type": "STATE", "state": public_state()})
+
+def reset_sheet(n: int = None):
+    if n is None:
+        n = GAME["sheet_n"]
+    GAME["sheet_n"] = max(1, min(6, int(n)))
+    GAME["cards"] = make_cards(GAME["sheet_n"], free_enabled=GAME["free_enabled"])
+    GAME["focus_idx"] = None
+    GAME["status"] = "LISTENING"
+    broadcast({"type": "STATE", "state": public_state()})
+
+def mark_call(letter: str, number: int):
+    for c in GAME["cards"]:
+        mark_call_on_card(c, letter, number)
+    broadcast({"type": "CALL", "call": f"{letter}{number}", "state": public_state()})
+
+def set_parse_mode(mode: str):
+    mode = "SETUP" if str(mode).upper().startswith("SETUP") else "PLAY"
+    try:
+        MODE_FILE.write_text(mode)
+    except Exception:
+        pass
+    broadcast({"type": "CONFIG", "key": "parse_mode", "value": mode})
+
+# ------------------ Premark helpers ------------------
+def _for_all_numbers(fn):  # fn(letter, number) -> bool mark?
+    for card in GAME["cards"]:
+        for L in "BINGO":
+            for n in card["cols"][L]:
+                if n == 0:
+                    continue
+                if fn(L, n):
+                    card["marks"][f"{L}{n}"] = True
+    broadcast({"type": "STATE", "state": public_state()})
+
+def premark_special_number(ball: int):
+    digits = set(str(ball))
+    def should_mark(_L, n):
+        return any(d in str(n) for d in digits)
+    _for_all_numbers(should_mark)
+    GAME["program"]["params"]["digits"] = sorted(list(digits))
+
+def premark_odd_even(first_kind: str):
+    first_kind = "odd" if str(first_kind).lower().startswith("o") else "even"
+    def mark_predicate(_L, n):
+        return (n % 2 == 1) if first_kind == "odd" else (n % 2 == 0)
+    _for_all_numbers(mark_predicate)
+    GAME["program"]["params"]["first"] = first_kind
+
+# ------------------ Listener Thread (mic via listen.sh) ------------------
+class Listener(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.proc = None
+        self._stop = threading.Event()
+
+    def run(self):
+        env = os.environ.copy()
+        env["ALSA_DEV"]      = DEVICE_HINT
+        env["WHISPER_BIN"]   = WHISPER_BIN
+        env["WHISPER_MODEL"] = MODEL_PATH
+        try:
+            self.proc = subprocess.Popen(
+                ["bash", LISTEN_SH],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cwd=str(APP_DIR), env=env, text=True, bufsize=1
+            )
+        except FileNotFoundError:
+            print("listen.sh not found; running without mic.")
+            return
+
+        for line in self.proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except Exception:
+                print(f"[listen.sh] {line}")
+                continue
+
+            raw = evt.get("raw")
+            if raw:
+                GAME["last_heard"] = str(raw)
+                try:
+                    broadcast({"type":"HEARD", "raw": raw})
+                except Exception:
+                    pass
+
+            EVENT_QUEUE.put(evt)
+            if evt.get("type") == "CALL":
+                try:
+                    mark_call(evt["letter"], int(evt["number"]))
+                except Exception:
+                    pass
+            elif evt.get("type") == "PHRASE":
+                if evt.get("event") == "GOOD_BINGO":
+                    GAME["status"] = "GOOD_BINGO"
+                    if os.path.isfile(VICTORY_PATH):
+                        play_wav(VICTORY_PATH)
+                    WINNER.start()
+                    broadcast({"type": "STATUS", "status": "GOOD_BINGO"})
+                elif evt.get("event") == "GAME_CLOSED":
+                    GAME["status"] = "GAME_CLOSED"
+                    broadcast({"type": "STATUS", "status": "GAME_CLOSED"})
+
+    def stop(self):
+        self._stop.set()
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+        except Exception:
+            pass
+
+listener = Listener()
+listener.start()
+atexit.register(listener.stop)
+
+# ------------------ Flask App ------------------
+app = Flask(
+    __name__,
+    template_folder=str(APP_DIR / "templates"),
+    static_folder=str(APP_DIR / "static"),
+)
+sock = Sock(app)
+
+# ----------- Page -----------
+@app.get("/")
+def index():
+    return render_template("index.html")
+
+# ----------- State APIs -----------
+@app.get("/api/state")
+def api_state():
+    return jsonify(public_state())
+
+@app.post("/api/start")
+def api_start():
+    if os.path.isfile(JINGLE_PATH):
+        play_wav(JINGLE_PATH)
+    set_parse_mode("SETUP")
+    set_view("SETUP_GAMES")
+    try:
+        say("Welcome to Betty Bot. How many games will you be playing tonight?")
+    except Exception:
+        pass
+    return jsonify({"ok": True})
+
+@app.post("/api/set_session_games")
+def api_set_session_games():
+    d = request.get_json(force=True, silent=True) or {}
+    n = int(d.get("count", 1))
+    n = max(1, min(20, n))
+    GAME["session_total_games"] = n
+    GAME["session_lineup"] = []     # we will collect these next
+    GAME["current_game_idx"] = 0
+    set_view("PROGRAM_PICK")
+    set_parse_mode("SETUP")         # keep in setup while picking games
+    try:
+        say("Great. Let's pick the games. What is game one?")
+    except Exception:
+        pass
+    return jsonify({"ok": True, "count": n})
+
+# ----------- Programs / Session lineup -----------
+@app.get("/api/programs")
+def api_programs():
+    items = []
+    for key, spec in PROGRAMS.items():
+        items.append({
+            "key": key,
+            "name": spec["name"],
+            "desc": spec["desc"],
+            "kind": spec["kind"],
+            "params": spec.get("params", {}),
+            "preview_cells": spec.get("preview_cells", []),
+        })
+    return jsonify({
+        "programs": items,
+        "active": {
+            "key": GAME["program_key"],
+            "name": GAME["program"]["name"],
+            "desc": GAME["program"]["desc"],
+            "kind": GAME["program"]["kind"],
+            "params": GAME["program"].get("params", {}),
+            "preview_cells": program_preview_cells(),
+        },
+        "session": {
+            "total": GAME["session_total_games"],
+            "lineup": GAME["session_lineup"],
+            "index": GAME["current_game_idx"],
+        },
+        "free_enabled": GAME["free_enabled"],
+    })
+
+@app.post("/api/session/lineup")
+def api_session_lineup():
+    """
+    Body: { lineup: ["CLASSIC","HARD_WAYS",...], replace?:true }
+    If lineup shorter than total, we keep collecting via UI.
+    """
+    d = request.get_json(force=True, silent=True) or {}
+    lineup = d.get("lineup") or []
+    if not isinstance(lineup, list):
+        return jsonify({"ok": False, "error": "lineup must be a list"}), 400
+    clean = []
+    for k in lineup:
+        k2 = str(k).upper()
+        if k2 in PROGRAMS:
+            clean.append(k2)
+    GAME["session_lineup"] = clean[: max(0, int(GAME["session_total_games"] or 0))]
+    return jsonify({"ok": True, "session_lineup": GAME["session_lineup"], "total": GAME["session_total_games"]})
+
+@app.post("/api/session/start")
+def api_session_start():
+    """
+    Locks lineup and starts Game 1.
+    """
+    if not GAME["session_total_games"]:
+        return jsonify({"ok": False, "error": "set session games first"}), 400
+    if not GAME["session_lineup"]:
+        # default to CLASSIC repeated if nothing chosen
+        GAME["session_lineup"] = ["CLASSIC"] * GAME["session_total_games"]
+    GAME["current_game_idx"] = 0
+    key = GAME["session_lineup"][0]
+    set_program_by_key(key)
+    reset_sheet(GAME["sheet_n"])
+    set_parse_mode("PLAY")
+    set_view("OVERVIEW")
+    say(f"Starting game one: {GAME['program']['name']}.")
+    return jsonify({"ok": True, "state": public_state()})
+
+@app.post("/api/game/next")
+def api_game_next():
+    """
+    Advance to the next game in the lineup. Resets sheet and status.
+    """
+    total = int(GAME["session_total_games"] or 0)
+    idx = int(GAME["current_game_idx"] or 0) + 1
+    if total == 0:
+        return jsonify({"ok": False, "error": "no active session"}), 400
+    if idx >= total:
+        # end of session
+        GAME["current_game_idx"] = total
+        GAME["status"] = "SESSION_DONE"
+        broadcast({"type": "STATUS", "status": "SESSION_DONE"})
+        say("Session complete.")
+        return jsonify({"ok": True, "done": True, "state": public_state()})
+    GAME["current_game_idx"] = idx
+    key = GAME["session_lineup"][idx] if idx < len(GAME["session_lineup"]) else "CLASSIC"
+    set_program_by_key(key)
+    reset_sheet(GAME["sheet_n"])
+    set_parse_mode("PLAY")
+    say(f"Starting game {idx+1}: {GAME['program']['name']}.")
+    return jsonify({"ok": True, "state": public_state()})
+
+# Special flows
+@app.post("/api/program/special-number/premark")
+def api_program_special_number_premark():
+    if GAME["program_key"] != "SPECIAL_NUMBER":
+        return jsonify({"ok": False, "error": "Active program is not Special Number"}), 400
+    d = request.get_json(force=True, silent=True) or {}
+    ball = int(d.get("ball", -1))
+    if ball < 1 or ball > 75:
+        return jsonify({"ok": False, "error": "ball must be 1..75"}), 400
+    premark_special_number(ball)
+    say(f"Special number is {ball}. Matching digits are premarked.")
+    return jsonify({"ok": True, "program": public_state()["program"]})
+
+@app.post("/api/program/odd-even/premark")
+def api_program_odd_even_premark():
+    if GAME["program_key"] != "ODD_EVEN":
+        return jsonify({"ok": False, "error": "Active program is not Odd or Even"}), 400
+    d = request.get_json(force=True, silent=True) or {}
+    first = str(d.get("first","")).strip().lower()
+    if first not in ("odd","even"):
+        return jsonify({"ok": False, "error": "first must be 'odd' or 'even'"}), 400
+    premark_odd_even(first)
+    say(f"{first.capitalize()} numbers premarked.")
+    return jsonify({"ok": True, "program": public_state()["program"]})
+
+# ----------- Sheet / Focus -----------
+@app.post("/api/new_sheet")
+def api_new_sheet():
+    reset_sheet(GAME["sheet_n"])
+    return jsonify({"ok": True})
+
+@app.post("/api/set_sheet_n")
+def api_set_sheet_n():
+    d = request.get_json(force=True, silent=True) or {}
+    n = int(d.get("n", GAME["sheet_n"]))
+    reset_sheet(n)
+    set_view("OVERVIEW")
+    return jsonify({"ok": True, "sheet_n": GAME["sheet_n"]})
+
+@app.post("/api/focus")
+def api_focus():
+    d = request.get_json(force=True, silent=True) or {}
+    idx = int(d.get("index", -1))
+    if idx < 0:
+        GAME["focus_idx"] = None
+        set_view("OVERVIEW")
+    else:
+        idx = max(0, min(len(GAME["cards"]) - 1, idx))
+        GAME["focus_idx"] = idx
+        set_view("FOCUS")
+    return jsonify({"ok": True, "focus_idx": GAME["focus_idx"], "view": GAME["view"]})
+
+# ----------- Calls -----------
+@app.post("/api/sim_call")
+def api_sim_call():
+    d = request.get_json(force=True, silent=True) or {}
+    L = (d.get("letter") or "G").upper()
+    n = int(d.get("number") or 46)
+    mark_call(L, n)
+    return jsonify({"ok": True})
+
+@app.post("/api/repeat")
+def api_repeat():
+    last = None
+    for c in GAME["cards"]:
+        if c["calls"]:
+            last = c["calls"][-1]
+    if last:
+        L, n = last[0], int(last[1:])
+        mark_call(L, n)
+    return jsonify({"ok": True})
+
+# ----------- Winner control -----------
+@app.post("/api/winner/stop")
+def api_winner_stop():
+    WINNER.stop()
+    GAME["status"] = "LISTENING"
+    broadcast({"type": "STATUS", "status": GAME["status"]})
+    # After winner is checked/confirmed, move to next game
+    return api_game_next()
+
+# ----------- Mode / Gain / TTS / Audio test -----------
+@app.post("/api/mode")
+def api_mode_set():
+    d = request.get_json(force=True, silent=True) or {}
+    set_mode(d.get("mode", "PLAY"))
+    return jsonify({"ok": True, "mode": GAME["mode"]})
+
+@app.get("/api/gain")
+def api_gain_get():
+    return jsonify({"gain": read_gain()})
+
+@app.post("/api/gain")
+def api_gain_set():
+    d = request.get_json(force=True, silent=True) or {}
+    try:
+        val = float(d.get("gain", read_gain()))
+        val = max(0.5, min(6.0, val))
+        GAIN_FILE.write_text(f"{val:.2f}")
+        broadcast({"type": "CONFIG", "key": "gain", "value": val})
+        return jsonify({"ok": True, "gain": val})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+@app.post("/api/say")
+def api_say():
+    d = request.get_json(force=True, silent=True) or {}
+    text = str(d.get("text", "")).strip()
+    if not text:
+        return jsonify({"ok": False, "error": "no text"}), 400
+    try:
+        say(text)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.post("/api/audio/jingle")
+def api_audio_jingle():
+    if os.path.isfile(JINGLE_PATH):
+        play_wav(JINGLE_PATH)
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "jingle not found"}), 404
+
+# ----------- Speaker Volume APIs -----------
+@app.get("/api/volume/speaker")
+def api_speaker_get():
+    vol = get_speaker_volume()
+    return jsonify({"speaker": vol})
+
+@app.post("/api/volume/speaker")
+def api_speaker_set():
+    d = request.get_json(force=True, silent=True) or {}
+    pct = int(d.get("speaker", -1))
+    newv = set_speaker_volume(pct)
+    if newv < 0:
+        return jsonify({"ok": False, "error": "Unable to set speaker volume"}), 400
+    broadcast({"type": "CONFIG", "key": "speaker", "value": newv})
+    return jsonify({"ok": True, "speaker": newv})
+
+# ----------- WebSocket (push state + heard overlays) -----------
+@sock.route("/ws")
+def ws(ws):
+    WS_CLIENTS.add(ws)
+    try:
+        ws.send(json.dumps({"type": "STATE", "state": public_state()}))
+        while True:
+            time.sleep(1.0)
+            try:
+                ws.send(json.dumps({"type": "PING", "t": time.time()}))
+            except Exception:
+                break
+    finally:
+        WS_CLIENTS.discard(ws)
+
+# ------------------ Boot defaults ------------------
+try:
+    MODE_FILE.write_text("PLAY")
+except Exception:
+    pass
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT)
+```
+
+=== FILE: bingo_parse.py ===
+```python
+#!/usr/bin/env python3
+# /opt/bettybot/bingo_parse.py
+import sys, re, json, time, difflib
+from typing import List, Tuple, Optional
+
+# ------------ Config ------------
+FUZZ_STRICT = 0.90
+FUZZ_LENIENT = 0.82
+
+# How long we keep a lonely letter waiting for digits (e.g., "B ... one ... two")
+ASSEMBLY_WINDOW_SEC = 5.0
+
+# After we emit a call, ignore identical repeats for this long
+DEBOUNCE_CALL_SEC = 3.0
+
+# Phrase debounce
+DEBOUNCE_PHRASE_SEC = 3.0
+
+# ------------ Phrase detection (kept; may expand later) ------------
+PHRASES = {
+    "GOOD_BINGO": [
+        "that's a good bingo", "thats a good bingo",
+        "good bingo", "confirmed bingo", "verified bingo"
+    ],
+    "GAME_CLOSED": [
+        "this game is closed", "game is closed", "the game is closed",
+        "close the game", "game closed"
+    ],
+}
+last_phrase_hits = {k: [] for k in PHRASES.keys()}
+
+# ------------ Setup intents (new) ------------
+YES_WORDS = {
+    "yes","yeah","yep","yup","correct","that is correct","thats correct",
+    "right","that is right","thats right","affirmative","sure","okay","ok","okey"
+}
+NO_WORDS = {
+    "no","nope","nah","negative","incorrect","that is not right","not right",
+    "that is wrong","wrong","cancel","change","try again"
+}
+GAMES_KEYWORDS = {"game","games","round","rounds","card","cards"}
+
+def normalize_text(s: str) -> str:
+    s = s.lower().strip()
+    return re.sub(r"[^a-z0-9\s,-]", "", s)
+
+def best_phrase_match(text: str):
+    text = normalize_text(text)
+    best = (None, 0.0)
+    for key, variants in PHRASES.items():
+        for v in variants:
+            score = difflib.SequenceMatcher(None, text, v).ratio()
+            if v in text:
+                score = max(score, 0.95)
+            if score > best[1]:
+                best = (key, score)
+    return best
+
+def emit(obj: dict):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+# ------------ Bingo call parsing ------------
+# Accept direct form like "B12" too; enforce 1..75 later
+DIRECT_RE = re.compile(r"\b([bingoBINGO])[ ]?-?\s*(\d{1,2})\b")
+
+# Letter token synonyms (robust to mishears)
+LETTER_MAP = {
+    # --- B (most fragile) ---
+    "b": "B", "bee": "B", "be": "B", "b.": "B",
+    "p": "B", "pea": "B", "pee": "B",          # P misheard for B
+    "d": "B", "dee": "B",                       # D -> B
+    "v": "B", "vee": "B",                       # V -> B
+
+    # --- I ---
+    "i": "I", "eye": "I", "aye": "I", "hi": "I",
+
+    # --- N ---
+    "n": "N", "en": "N", "and": "N", "end": "N", "in": "N", "ann": "N",
+
+    # --- G ---
+    "g": "G", "gee": "G", "gi": "G",
+
+    # --- O ---
+    "o": "O", "oh": "O", "owe": "O", "zero": "O",  # careful: 'zero' only as letter if clearly not a number
+}
+
+# Number words
+NUM_WORDS_0_19 = {
+    "zero": 0, "oh": 0,  # only used when we KNOW we're parsing a number
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19
+}
+TENS_WORDS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fourty": 40,  # common mis-say
+    "fifty": 50, "sixty": 60, "seventy": 70,
+}
+
+# Game constraints
+LETTER_RANGES = {
+    "B": range(1, 16),
+    "I": range(16, 31),
+    "N": range(31, 46),
+    "G": range(46, 61),
+    "O": range(61, 76),
+}
+
+# Rolling state across lines to assemble split calls like "B ... one ... two"
+pending_letter: Optional[str] = None
+pending_letter_time: float = 0.0
+last_emitted: Optional[str] = None  # e.g., "B12"
+last_emitted_time: float = 0.0
+
+def now() -> float:
+    return time.time()
+
+def reset_pending():
+    global pending_letter, pending_letter_time
+    pending_letter = None
+    pending_letter_time = 0.0
+
+def in_range(letter: str, num: int) -> bool:
+    return (letter in LETTER_RANGES) and (num in LETTER_RANGES[letter])
+
+def safe_emit_call(letter: str, num: int, raw: str):
+    global last_emitted, last_emitted_time
+    # Never emit 0 in bingo
+    if num == 0:
+        return
+    # Enforce valid range
+    if not in_range(letter, num):
+        return
+    call = f"{letter}{num}"
+    t = now()
+    if last_emitted == call and (t - last_emitted_time) < DEBOUNCE_CALL_SEC:
+        return
+    last_emitted, last_emitted_time = call, t
+    emit({"type": "CALL", "letter": letter, "number": num, "raw": raw})
+
+def token_is_letter(tok: str) -> Optional[str]:
+    tok = tok.lower()
+    return LETTER_MAP.get(tok)
+
+def word_to_number(tok: str) -> Optional[int]:
+    """Parse a single token that may be a number word or digits."""
+    tok = tok.lower().replace("-", " ")
+    # digits?
+    if tok.isdigit():
+        return int(tok)
+    # single word 0-19
+    if tok in NUM_WORDS_0_19:
+        return NUM_WORDS_0_19[tok]
+    # tens-only word
+    if tok in TENS_WORDS:
+        return TENS_WORDS[tok]
+    return None
+
+def parse_number_from_tokens(tokens: List[str], start_idx: int) -> Tuple[Optional[int], int]:
+    """
+    Try to parse a bingo number (1..75) from tokens[start_idx:].
+    Supports:
+      - "12"
+      - "twelve"
+      - "twenty five"/"twenty-five"
+      - split digits after letter: "one two" -> 12
+    Returns (number, next_index_after_consumed)
+    """
+    i = start_idx
+    if i >= len(tokens):
+        return None, i
+
+    t0 = tokens[i].lower().replace("-", " ")
+
+    # A: plain digits
+    if t0.isdigit():
+        return int(t0), i + 1
+
+    # B: single word 0-19
+    if t0 in NUM_WORDS_0_19:
+        return NUM_WORDS_0_19[t0], i + 1
+
+    # C: tens + optional unit (e.g., "seventy five")
+    if t0 in TENS_WORDS:
+        tens = TENS_WORDS[t0]
+        n = tens
+        if i + 1 < len(tokens):
+            u = tokens[i + 1].lower()
+            if u in NUM_WORDS_0_19 and 0 < NUM_WORDS_0_19[u] < 10:
+                n = tens + NUM_WORDS_0_19[u]
+                return n, i + 2
+        return n, i + 1
+
+    # D: hyphenated parts already split earlier
+    parts = t0.split()
+    if len(parts) == 2 and parts[0] in TENS_WORDS and parts[1] in NUM_WORDS_0_19 and 0 < NUM_WORDS_0_19[parts[1]] < 10:
+        n = TENS_WORDS[parts[0]] + NUM_WORDS_0_19[parts[1]]
+        return n, i + 1
+
+    # E: two consecutive unit digits like "one two" -> 12
+    if NUM_WORDS_0_19.get(t0) in range(0,10):
+        if i + 1 < len(tokens):
+            t1 = tokens[i + 1].lower()
+            if NUM_WORDS_0_19.get(t1) in range(0,10):
+                n = NUM_WORDS_0_19[t0] * 10 + NUM_WORDS_0_19[t1]
+                return n, i + 2
+
+    return None, i
+
+def try_parse_bingo_call_from_line(line: str) -> Optional[Tuple[str,int]]:
+    """
+    First: try direct 'B12' style (with sanity range).
+    Then: look for 'B ... twelve/1 2' patterns.
+    """
+    raw = line
+    line = normalize_text(line)
+
+    # Direct B12 form
+    m = DIRECT_RE.search(line)
+    if m:
+        letter = m.group(1).upper()
+        num = int(m.group(2))
+        if 1 <= num <= 75 and in_range(letter, num):
+            return letter, num
+
+    # Token walk: assemble letter, then number
+    tokens = [t for t in re.split(r"[,\s]+", line) if t]
+    i = 0
+    while i < len(tokens):
+        # find a letter token
+        L = token_is_letter(tokens[i])
+        if not L:
+            i += 1
+            continue
+        j = i + 1
+        # Skip filler like "as in", "as", "letter"
+        while j < len(tokens) and tokens[j] in {"as","in","letter"}:
+            j += 1
+        # parse a number from j
+        num, j2 = parse_number_from_tokens(tokens, j)
+        if num is not None and 1 <= num <= 75 and in_range(L, num):
+            return L, num
+
+        # If we saw a letter but no immediate number, stash in pending and continue
+        remember_pending_letter(L)
+        i = j
+    return None
+
+def remember_pending_letter(L: str):
+    global pending_letter, pending_letter_time
+    pending_letter = L
+    pending_letter_time = now()
+
+def maybe_complete_with_pending(line: str) -> Optional[Tuple[str,int]]:
+    """
+    If we have a recent pending letter and this line has digits/number words,
+    combine them into a call.
+    """
+    global pending_letter, pending_letter_time
+    if not pending_letter:
+        return None
+    if (now() - pending_letter_time) > ASSEMBLY_WINDOW_SEC:
+        reset_pending()
+        return None
+
+    text = normalize_text(line)
+    tokens = [t for t in re.split(r"[,\s]+", text) if t]
+    # Try number
+    num, _ = parse_number_from_tokens(tokens, 0)
+    # Special: two 1-digit words like "one two"
+    if num is None and len(tokens) >= 2:
+        a = NUM_WORDS_0_19.get(tokens[0], None)
+        b = NUM_WORDS_0_19.get(tokens[1], None)
+        if a in range(0,10) and b in range(0,10):
+            num = a*10 + b
+    if num is not None and 1 <= num <= 75 and in_range(pending_letter, num):
+        L = pending_letter
+        reset_pending()
+        return L, num
+    return None
+
+def handle_phrase_line(line: str):
+    event, score = best_phrase_match(line)
+    if not event:
+        return
+    t = now()
+    hits = last_phrase_hits[event]
+    hits[:] = [ts for ts in hits if t - ts <= DEBOUNCE_PHRASE_SEC]
+    accept = score >= FUZZ_STRICT or (score >= FUZZ_LENIENT and len(hits) >= 1)
+    hits.append(t)
+    if accept:
+        last_phrase_hits[event].clear()
+        emit({"type": "PHRASE", "event": event, "confidence": round(score,3), "raw": line})
+
+# ------------ Setup-intent helpers (new) ------------
+def maybe_emit_yes_no(line_norm: str, raw: str) -> bool:
+    """Emit CONFIRM YES/NO intents (debounced by textual content)."""
+    txt = line_norm.strip()
+    # Use simple token containment; 'ok' and 'okay' map to YES here for seniors' convenience
+    # Prefer explicit "no" if both present (rare, but e.g., "no, yes" -> treat as NO)
+    tokens = set(re.split(r"[,\s]+", txt))
+    # Heuristic: if sentence has "no" variants anywhere, prefer NO
+    if any(w in tokens for w in NO_WORDS):
+        emit({"type": "INTENT", "intent": "CONFIRM", "value": "NO", "raw": raw})
+        return True
+    if any(w in tokens for w in YES_WORDS):
+        emit({"type": "INTENT", "intent": "CONFIRM", "value": "YES", "raw": raw})
+        return True
+    return False
+
+def maybe_emit_games_count(line_norm: str, raw: str) -> bool:
+    """
+    If user says a number 1..20 and mentions 'game/games/round/card', emit SETUP_GAMES count.
+    """
+    tokens = [t for t in re.split(r"[,\s]+", line_norm) if t]
+    if not tokens:
+        return False
+    has_keyword = any(k in tokens for k in GAMES_KEYWORDS) or ("how" in tokens and "many" in tokens)
+    if not has_keyword:
+        return False
+
+    # Find first reasonable number in 1..20
+    i = 0
+    while i < len(tokens):
+        n, j = parse_number_from_tokens(tokens, i)
+        if n is not None:
+            if 1 <= n <= 20:
+                emit({"type": "INTENT", "intent": "SETUP_GAMES", "count": int(n), "raw": raw})
+                return True
+            # Skip obviously out-of-range numbers; continue scanning
+            i = j
+            continue
+        i += 1
+    return False
+
+# ------------ Main dispatcher ------------
+def process_line(s: str):
+    raw = s
+    # 1) Try immediate full call
+    res = try_parse_bingo_call_from_line(raw)
+    if res:
+        L, num = res
+        safe_emit_call(L, num, raw)
+        return
+
+    # 2) If not, see if it completes a pending letter
+    res2 = maybe_complete_with_pending(raw)
+    if res2:
+        L, num = res2
+        safe_emit_call(L, num, raw)
+        return
+
+    # 3) Still nothing? Maybe we only heard the letter here—stash it.
+    text = normalize_text(raw)
+    for tok in re.split(r"[,\s]+", text):
+        L = token_is_letter(tok)
+        if L:
+            remember_pending_letter(L)
+            break
+
+    # 4) Phrases (good bingo / game closed)
+    handle_phrase_line(raw)
+
+    # 5) Setup intents (yes/no; number-of-games 1..20)
+    if maybe_emit_yes_no(text, raw):
+        return
+    if maybe_emit_games_count(text, raw):
+        return
+
+# ------------ Main loop ------------
+for line in sys.stdin:
+    t = line.strip()
+    if not t:
+        continue
+    process_line(t)
+```
+
+=== FILE: export_code.py ===
+```python
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import os
+import sys
+
+# ---------- Config ----------
+IGNORE_DIRS = {
+    ".git", "node_modules", "venv", ".venv", "__pycache__", ".pytest_cache",
+    "dist", "build", ".idea", ".vscode", ".mypy_cache", ".ruff_cache", "lidar_txt", "cache", "whisper.cpp", "venv", ".venv",
+}
+
+# Always ignore these exact filenames (anywhere in tree)
+IGNORE_FILENAMES = {
+    ".env", ".json", # main ask
+}
+
+# Ignore any filename matching these prefixes
+IGNORE_PREFIXES = {
+    ".env", ".json",  # .env, .env.local, .env.production, etc.
+}
+
+# Hidden files are ignored by default except these
+ALLOWLIST_HIDDEN_FILES = {".gitignore"}
+
+# Common binary / large file extensions we’ll skip fast
+BINARY_EXTS = {
+    ".png",".jpg",".jpeg",".gif",".webp",".bmp",".ico",
+    ".pdf",".zip",".gz",".tar",".tgz",".rar",".7z",
+    ".mp3",".wav",".flac",".mp4",".mov",".avi",".mkv",
+    ".ttf",".otf",".woff",".woff2",
+    ".so",".dll",".dylib",
+    ".pyc",".pyo",".json",
+}
+
+# Language hint by extension for nicer code fences
+LANG_BY_EXT = {
+    ".py":"python", ".js":"javascript", ".ts":"typescript", ".tsx":"tsx", ".jsx":"jsx",
+    ".json":"json", ".yml":"yaml", ".yaml":"yaml", ".toml":"toml", ".ini":"ini",
+    ".sh":"bash", ".bash":"bash", ".zsh":"zsh",
+    ".html":"html", ".css":"css", ".scss":"scss",
+    ".sql":"sql", ".md":"markdown", ".jinja":"jinja", ".jinja2":"jinja",
+    ".env":"bash", ".txt":"", ".cfg":"ini",
+}
+
+DEFAULT_MAX_BYTES_PER_FILE = 1_000_000  # 1 MB cap per file (paste-friendly)
+
+
+def is_hidden(name: str) -> bool:
+    return name.startswith(".")
+
+def should_ignore_file(fname: str) -> bool:
+    base = os.path.basename(fname)
+    # Exact filename ignore (e.g., ".env")
+    if base in IGNORE_FILENAMES:
+        return True
+    # Prefix ignores (e.g., ".env.local")
+    for p in IGNORE_PREFIXES:
+        if base.startswith(p):
+            return True
+    # Ignore hidden files unless allowlisted
+    if is_hidden(base) and base not in ALLOWLIST_HIDDEN_FILES:
+        return True
+    # Skip obvious binaries by extension
+    _, ext = os.path.splitext(base.lower())
+    if ext in BINARY_EXTS:
+        return True
+    return False
+
+def is_text_file(path: str, max_bytes: int) -> bool:
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(min(65536, max_bytes))
+        # quick utf-8 check
+        chunk.decode("utf-8")
+        return True
+    except Exception:
+        return False
+
+def read_text(path: str, max_bytes: int) -> str:
+    size = os.path.getsize(path)
+    if size > max_bytes:
+        # Read the head only, but mark it truncated
+        with open(path, "rb") as f:
+            data = f.read(max_bytes)
+        text = data.decode("utf-8", errors="replace")
+        text += f"\n\n/* --- TRUNCATED: file size {size} bytes exceeds cap {max_bytes} --- */\n"
+        return text
+    with open(path, "r", encoding="utf-8", errors="strict") as f:
+        return f.read()
+
+def lang_for_file(path: str) -> str:
+    _, ext = os.path.splitext(path.lower())
+    return LANG_BY_EXT.get(ext, "")
+
+def should_ignore_dir(dirname: str) -> bool:
+    base = os.path.basename(dirname)
+    if base in IGNORE_DIRS:
+        return True
+    # Ignore hidden dirs generally
+    if is_hidden(base) and base not in ALLOWLIST_HIDDEN_FILES:
+        return True
+    return False
+
+def export_tree(root: str, max_bytes_per_file: int) -> str:
+    lines = []
+    ts = dt.datetime.now().isoformat(timespec="seconds")
+    lines.append(f"# Code Snapshot\n# Root: {os.path.abspath(root)}\n# Generated: {ts}\n")
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune ignored dirs in-place for os.walk efficiency
+        dirnames[:] = [d for d in dirnames if not should_ignore_dir(os.path.join(dirpath, d))]
+
+        for fn in sorted(filenames):
+            path = os.path.join(dirpath, fn)
+
+            if should_ignore_file(path):
+                continue
+
+            # Only include text files
+            try:
+                if not is_text_file(path, max_bytes_per_file):
+                    continue
+            except Exception:
+                continue
+
+            rel = os.path.relpath(path, root)
+            lang = lang_for_file(path)
+            try:
+                content = read_text(path, max_bytes_per_file)
+            except Exception as e:
+                # If we can’t read, skip with a note
+                content = f"/* ERROR READING FILE: {e} */\n"
+
+            # Separator + fenced block
+            lines.append(f"\n=== FILE: {rel} ===")
+            lines.append(f"```{lang}".rstrip())  # no trailing space if lang is ""
+            lines.append(content.rstrip("\n"))
+            lines.append("```")
+
+    return "\n".join(lines) + "\n"
+
+def main():
+    ap = argparse.ArgumentParser(description="Export project code to a single paste-friendly snapshot.")
+    ap.add_argument("--root", default=".", help="Project root to walk (default: .)")
+    ap.add_argument("--output", default="export_code_snapshot.txt", help="Output file path (default: export_code_snapshot.txt)")
+    ap.add_argument("--max-bytes-per-file", type=int, default=DEFAULT_MAX_BYTES_PER_FILE,
+                    help=f"Cap per file in bytes (default: {DEFAULT_MAX_BYTES_PER_FILE})")
+    args = ap.parse_args()
+
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(root):
+        print(f"error: root is not a directory: {root}", file=sys.stderr)
+        sys.exit(1)
+
+    snapshot = export_tree(root, args.max_bytes_per_file)
+
+    try:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(snapshot)
+        print(f"Wrote snapshot → {args.output}")
+    except Exception as e:
+        print(f"error writing output: {e}", file=sys.stderr)
+        sys.exit(2)
+
+if __name__ == "__main__":
+    main()
+```
+
+=== FILE: listen.sh ===
+```bash
+#!/usr/bin/env bash
+# /opt/bettybot/listen.sh — VAD-triggered chunks for Whisper -> bingo_parse (JSON to stdout)
+set -Eeuo pipefail
+
+# ---------- Core Config ----------
+DEV_IN="${ALSA_DEV:-}"
+WHISPER_BIN="${WHISPER_BIN:-/opt/bettybot/whisper.cpp/build/bin/whisper-cli}"
+MODEL_PATH="${WHISPER_MODEL:-/opt/bettybot/whisper.cpp/models/ggml-tiny.en.bin}"
+
+LEN="${LEN:-3.0}"                 # seconds per chunk
+THREADS="${WHISPER_THREADS:-6}"
+FAST_DECODE="${FAST_DECODE:-1}"   # 1 = greedy decode flags
+SPEEDUP="${WHISPER_SPEEDUP:-0}"   # 1 = add --speed-up if supported
+DEBUG="${DEBUG:-1}"
+
+PROMPT_TEXT=${PROMPT_TEXT:-$'You will hear bingo calls spoken twice, e.g., "B twelve, B one two". Output a single normalized call in the format "<LETTER> <NUMBER>" (e.g., "B 12"). Valid letters: B,I,N,G,O. Valid ranges: B 1–15, I 16–30, N 31–45, G 46–60, O 61–75. Output only the call.'}
+
+# --- Mode-aware prompts (added) ---
+PROMPT_PLAY=${PROMPT_PLAY:-"$PROMPT_TEXT"}
+PROMPT_SETUP=${PROMPT_SETUP:-$'You will hear very short answers. Transcribe only “yes”, “no”, or a number 1–20 (digits preferred). Do not add extra words.'}
+MODE_FILE="/tmp/betty_parse_mode.txt"
+read_mode(){ [[ -f "$MODE_FILE" ]] && awk 'NR==1{print toupper($0)}' "$MODE_FILE" || echo "PLAY"; }
+
+# ---------- Audio / VAD Config ----------
+CAP_RATE="${CAP_RATE:-16000}"
+CAP_BITS=16
+CAP_IN_CH="${CAP_IN_CH:-2}"
+
+USE_VAD="${USE_VAD:-1}"
+VAD_THRESH_PCT="${VAD_THRESH_PCT:-2}"
+VAD_LEAD="${VAD_LEAD:-0.15}"
+
+# ---------- Paths ----------
+TMPDIR="/tmp/betty_chunks"
+mkdir -p "$TMPDIR"
+GAIN_FILE="/tmp/betty_gain.txt"
+
+# ---------- Helpers ----------
+have(){ command -v "$1" >/dev/null 2>&1; }
+dbg(){ [[ "$DEBUG" = "1" ]] && echo "[DEBUG] $*" >&2 || true; }
+read_gain(){ [[ -f "$GAIN_FILE" ]] && awk 'BEGIN{v=3}{v=$1}END{if(v<0.5)v=0.5;if(v>12)v=12;printf("%.2f",v)}' "$GAIN_FILE" 2>/dev/null || echo "3.00"; }
+
+# ---------- Sanity ----------
+for dep in sox soxi sed awk; do have "$dep" || { echo "❌ Missing dependency: $dep" >&2; exit 1; }; done
+[[ -x "$WHISPER_BIN" ]] || { echo "❌ whisper-cli not executable: $WHISPER_BIN" >&2; exit 1; }
+[[ -f "$MODEL_PATH"   ]] || { echo "❌ model not found: $MODEL_PATH" >&2; exit 1; }
+if have stdbuf; then STDBUF_CMD=(stdbuf -oL -eL); else STDBUF_CMD=(); fi
+
+# ---------- Device probe ----------
+pick_device() {
+  local trylist=()
+  [[ -n "$DEV_IN" ]] && trylist+=("$DEV_IN")
+  trylist+=(
+    "plughw:CARD=ArrayUAC10,DEV=0" "hw:CARD=ArrayUAC10,DEV=0"
+    "sysdefault:CARD=ArrayUAC10" "front:CARD=ArrayUAC10,DEV=0" "dsnoop:CARD=ArrayUAC10,DEV=0"
+    "plughw:2,0" "hw:2,0" "plughw:1,0" "hw:1,0" "default" "sysdefault"
+  )
+  for d in "${trylist[@]}"; do
+    [[ -z "$d" ]] && continue
+    if have arecord; then
+      if arecord -q -D "$d" -f S16_LE -c "$CAP_IN_CH" -r "$CAP_RATE" -d 1 -t raw >/dev/null 2>&1; then
+        dbg "arecord probe OK: $d"; echo "$d"; return 0
+      else
+        dbg "arecord probe failed: $d"
+      fi
+    fi
+    if [[ "$DEBUG" = "1" ]]; then
+      if sox -V3 -t alsa "$d" -r "$CAP_RATE" -c "$CAP_IN_CH" -b "$CAP_BITS" -e signed-integer "$TMPDIR/probe.wav" trim 0 0.2; then
+        rm -f "$TMPDIR/probe.wav"; dbg "sox probe OK: $d"; echo "$d"; return 0
+      else
+        dbg "sox probe failed: $d"
+      fi
+    else
+      if sox -V0 -t alsa "$d" -r "$CAP_RATE" -c "$CAP_IN_CH" -b "$CAP_BITS" -e signed-integer "$TMPDIR/probe.wav" trim 0 0.2 2>/dev/null; then
+        rm -f "$TMPDIR/probe.wav"; echo "$d"; return 0
+      else
+        dbg "Probe failed: $d"
+      fi
+    fi
+  done
+  return 1
+}
+
+# Warn if Flask may also hold the mic (harmless if you pass ALSA_DEV)
+if pgrep -f bingo_app.py >/dev/null 2>&1; then
+  dbg "Note: bingo_app.py is running and may hold the mic unless ALSA_DEV is set."
+fi
+
+DEV="$(pick_device)" || { echo "❌ No working ALSA capture device." >&2; exit 1; }
+echo "✅ Using device: $DEV | LEN=${LEN}s | RATE=${CAP_RATE} | CH=${CAP_IN_CH} | THREADS=$THREADS | GAIN=$(read_gain) | VAD=$USE_VAD" >&2
+
+# ---------- Main loop ----------
+i=0
+while true; do
+  i=$((i+1))
+  RAW="$TMPDIR/raw_${i}.wav"
+  MONO="$TMPDIR/mono_${i}.wav"
+  PROC="$TMPDIR/proc_${i}.wav"
+
+  # 1) Capture chunk (VAD or open-mic)
+  if [[ "$USE_VAD" = "1" ]]; then
+    echo "[REC] waiting for voice (>${VAD_THRESH_PCT}% for ${VAD_LEAD}s) …" >&2
+    if [[ "$DEBUG" = "1" ]]; then
+      sox -V3 -t alsa "$DEV" -r "$CAP_RATE" -c "$CAP_IN_CH" -b "$CAP_BITS" -e signed-integer "$RAW" \
+        silence 1 "$VAD_LEAD" "${VAD_THRESH_PCT}%" trim 0 "$LEN" \
+        || { echo "⚠️ VAD capture failed; retrying…" >&2; sleep 0.2; continue; }
+    else
+      sox -V0 -t alsa "$DEV" -r "$CAP_RATE" -c "$CAP_IN_CH" -b "$CAP_BITS" -e signed-integer "$RAW" \
+        silence 1 "$VAD_LEAD" "${VAD_THRESH_PCT}%" trim 0 "$LEN" 2>/dev/null \
+        || { echo "⚠️ VAD capture failed; retrying…" >&2; sleep 0.2; continue; }
+    fi
+  else
+    echo "[REC] open-mic chunk $i…" >&2
+    if ! sox -V0 -t alsa "$DEV" -r "$CAP_RATE" -c "$CAP_IN_CH" -b "$CAP_BITS" -e signed-integer "$RAW" trim 0 "$LEN" 2>/dev/null; then
+      echo "⚠️ SoX capture failed; retrying…" >&2; sleep 0.2; continue
+    fi
+  fi
+
+  # 2) Ensure mono
+  if soxi -c "$RAW" 2>/dev/null | grep -q '^2$'; then
+    if ! sox -V0 "$RAW" "$MONO" remix 1 2>/dev/null; then MONO="$RAW"; fi
+  else
+    MONO="$RAW"
+  fi
+  rm -f "$RAW" 2>/dev/null || true
+
+  # 3) Apply software gain
+  GAIN="$(read_gain)"
+  if ! sox -V0 -v "$GAIN" "$MONO" "$PROC" 2>/dev/null; then
+    PROC="$MONO"
+  fi
+
+  # 4) Whisper -> transcript text (trim engine noise)
+  EXTRA_FLAGS=()
+  [[ "$FAST_DECODE" = "1" ]] && EXTRA_FLAGS+=(-bo 1 -bs 1 -nf)
+  if [[ "$SPEEDUP" = "1" ]]; then
+    "$WHISPER_BIN" -h 2>&1 | grep -q -- "--speed-up" && EXTRA_FLAGS+=(--speed-up)
+  fi
+
+  MODE_NOW="$(read_mode)"
+  if [[ "$MODE_NOW" == "SETUP" ]]; then
+    ACTIVE_PROMPT="$PROMPT_SETUP"
+  else
+    ACTIVE_PROMPT="$PROMPT_PLAY"
+  fi
+  EXTRA_FLAGS+=(--suppress-nst --prompt "$ACTIVE_PROMPT")
+
+  echo "[WH] transcribing chunk $i… (mode=$MODE_NOW)" >&2
+  TRANSCRIPT="$(
+    "${STDBUF_CMD[@]}" "$WHISPER_BIN" -m "$MODEL_PATH" -t "$THREADS" \
+      --language en --no-timestamps -sow -f "$PROC" "${EXTRA_FLAGS[@]}" 2>&1 \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^[[:space:]]*$/d; /^whisper_/d; /^system_info/d'
+  )"
+
+  # 5) Feed transcript to parser -> emit JSON to stdout for Flask
+  if [[ -n "$TRANSCRIPT" ]]; then
+    echo "[DEBUG_RAW][$MODE_NOW] $TRANSCRIPT" >&2
+    if have python3; then PYBIN=python3; else PYBIN=/opt/bettybot/venv/bin/python; fi
+    printf '%s\n' "$TRANSCRIPT" | "$PYBIN" -u /opt/bettybot/bingo_parse.py
+  else
+    echo "[DEBUG] (no transcript text this chunk)" >&2
+  fi
+
+  # 6) Housekeeping (keep last ~5 chunks)
+  rm -f "$TMPDIR"/mono_$((i-5)).wav "$TMPDIR"/proc_$((i-5)).wav 2>/dev/null || true
+done
+```
+
+=== FILE: patterns.py ===
+```python
+# /opt/bettybot/patterns.py
+from __future__ import annotations
+import json
+from pathlib import Path
+
+APP_DIR = Path(__file__).resolve().parent
+PATTERN_FILE = APP_DIR / "patterns.json"
+PATTERN_SCHEMA_VERSION = 2  # bump: now includes "programs"
+
+# ---------- tiny helpers ----------
+def row(r): return [[r, c] for c in range(5)]
+def col(c): return [[r, c] for r in range(5)]
+
+# ---------- shape presets (pure [r,c] cells) ----------
+# These are generic shapes the UI can draw/animate and (later) win-check against.
+PRESET_PATTERNS = {
+    "Giant X": {
+        "description": "Both diagonals.",
+        "cells": [[i, i] for i in range(5)] + [[i, 4 - i] for i in range(5)]
+    },
+    "Barbell": {
+        "description": "Two 3×3 blocks at the top corners connected by the middle row.",
+        "cells": (
+            [[r, c] for r in range(0, 3) for c in range(0, 3)] +     # TL 3x3
+            [[r, c] for r in range(0, 3) for c in range(2, 5)] +     # TR 3x3
+            [[2, c] for c in range(5)]                               # bridge row
+        )
+    },
+    "Five Around Corner (TL)": {
+        "description": "Five around the top-left corner.",
+        "cells": [[0,0],[0,1],[0,2],[1,0],[2,0]]
+    },
+    "Lucky 4": {
+        "description": "Number four: middle row and right column.",
+        "cells": row(2) + col(4)
+    },
+    "Six Pack (Center 2x3)": {
+        "description": "Six-pack 2 by 3, centered.",
+        "cells": [[1,2],[2,2],[3,2],[1,3],[2,3],[3,3]]
+    },
+    "Nine Pack (Center 3x3)": {
+        "description": "Nine-pack 3 by 3, center.",
+        "cells": [[r,c] for r in range(1,4) for c in range(1,4)]
+    },
+    "Lucky 7": {
+        "description": "Top row plus diagonal down-left from top-right.",
+        "cells": row(0) + [[1,3],[2,2],[3,1],[4,0]]
+    },
+}
+
+# ---------- programs (game “types”) ----------
+# Programs describe how the game runs. Some are fixed-shape, some need pre-mark logic.
+# kind:
+#   - classic        -> line bingo; params.free_enabled True/False
+#   - fixed_shape    -> just draw this shape (uses preview_cells)
+#   - special_number -> needs first ball; premark numbers containing its digits; then coverall
+#   - odd_even       -> needs first ball parity; premark odd/even; then coverall on opposite
+PROGRAMS = {
+    "CLASSIC": {
+        "name": "Classic Bingo",
+        "desc": "Standard line bingo. Free space is on.",
+        "kind": "classic",
+        "params": {"free_enabled": True},
+        "preview_cells": []  # UI may animate sample lines; shape left empty
+    },
+    "HARD_WAYS": {
+        "name": "Hard Ways Bingo",
+        "desc": "Line bingo with no free space.",
+        "kind": "classic",
+        "params": {"free_enabled": False},
+        "preview_cells": []
+    },
+    "LUCKY_7": {
+        "name": "Lucky 7",
+        "desc": "Top row plus a diagonal down-left from top-right.",
+        "kind": "fixed_shape",
+        "params": {},
+        "preview_cells": PRESET_PATTERNS["Lucky 7"]["cells"],
+    },
+    "SPECIAL_NUMBER": {
+        "name": "Special Number",
+        "desc": "After first ball, pre-mark all numbers containing any of its digits; then coverall.",
+        "kind": "special_number",
+        "params": {"digits": []},  # set at runtime
+        "preview_cells": []        # varies by first ball
+    },
+    "ODD_EVEN": {
+        "name": "Odds/Evens",
+        "desc": "If first ball is odd, pre-mark all odd numbers (or even if even). Then coverall with the opposite.",
+        "kind": "odd_even",
+        "params": {"first": None},  # "odd" | "even"
+        "preview_cells": []
+    },
+    "GIANT_X": {
+        "name": "Giant X",
+        "desc": "Both diagonals.",
+        "kind": "fixed_shape",
+        "params": {},
+        "preview_cells": PRESET_PATTERNS["Giant X"]["cells"],
+    },
+    "BARBELL": {
+        "name": "Barbell",
+        "desc": "Two 3×3 blocks at the top corners with a bar across the middle.",
+        "kind": "fixed_shape",
+        "params": {},
+        "preview_cells": PRESET_PATTERNS["Barbell"]["cells"],
+    },
+    "FIVE_AROUND_CORNER": {
+        "name": "Five Around the Corner",
+        "desc": "Five around a selected corner (default top-left).",
+        "kind": "fixed_shape",
+        "params": {"corner": "TL"},  # TL/TR/BL/BR — preview uses TL by default
+        "preview_cells": PRESET_PATTERNS["Five Around Corner (TL)"]["cells"],
+    },
+    "LUCKY_4": {
+        "name": "Lucky 4",
+        "desc": "A number 4 shape: middle row and right column.",
+        "kind": "fixed_shape",
+        "params": {},
+        "preview_cells": PRESET_PATTERNS["Lucky 4"]["cells"],
+    },
+    "SIX_PACK": {
+        "name": "Six Pack",
+        "desc": "A 2×3 block in the center.",
+        "kind": "fixed_shape",
+        "params": {"orientation": "2x3_center"},
+        "preview_cells": PRESET_PATTERNS["Six Pack (Center 2x3)"]["cells"],
+    },
+    "NINE_PACK": {
+        "name": "Nine Pack",
+        "desc": "A 3×3 block in the center.",
+        "kind": "fixed_shape",
+        "params": {"where": "center"},
+        "preview_cells": PRESET_PATTERNS["Nine Pack (Center 3x3)"]["cells"],
+    },
+}
+
+# ---------- file I/O ----------
+def _ensure_file():
+    """Create or refresh patterns.json; keep customs; refresh presets/programs from code."""
+    if PATTERN_FILE.exists():
+        try:
+            data = json.loads(PATTERN_FILE.read_text())
+            if isinstance(data, dict):
+                data.setdefault("schema", PATTERN_SCHEMA_VERSION)
+                data.setdefault("presets", {})
+                data.setdefault("custom", {})
+                data.setdefault("programs", {})
+                # refresh from code
+                data["presets"] = PRESET_PATTERNS
+                data["programs"] = PROGRAMS
+                PATTERN_FILE.write_text(json.dumps(data, indent=2))
+                return
+        except Exception:
+            pass
+    PATTERN_FILE.write_text(json.dumps({
+        "schema": PATTERN_SCHEMA_VERSION,
+        "presets": PRESET_PATTERNS,
+        "custom": {},
+        "programs": PROGRAMS,
+    }, indent=2))
+
+def _sanitize_cells(cells):
+    clean=[]
+    for pair in cells or []:
+        try:
+            r, c = int(pair[0]), int(pair[1])
+            if 0 <= r <= 4 and 0 <= c <= 4:
+                clean.append([r, c])
+        except Exception:
+            pass
+    return clean
+
+# ---------- public API (back-compat) ----------
+def load_all():
+    """
+    Returns presets + custom (shapes). Programs are available via load_programs().
+    """
+    _ensure_file()
+    try:
+        data = json.loads(PATTERN_FILE.read_text())
+    except Exception:
+        data = {"schema": PATTERN_SCHEMA_VERSION, "presets": PRESET_PATTERNS, "custom": {}, "programs": PROGRAMS}
+    # sanitize custom
+    custom = {}
+    for name, spec in (data.get("custom") or {}).items():
+        custom[name] = {
+            "description": (spec.get("description") or "").strip(),
+            "cells": _sanitize_cells(spec.get("cells"))
+        }
+    return {"schema": data.get("schema", PATTERN_SCHEMA_VERSION),
+            "presets": PRESET_PATTERNS,
+            "custom": custom}
+
+def load_programs():
+    """Return dict of program specs keyed by program key (e.g., 'CLASSIC')."""
+    _ensure_file()
+    try:
+        data = json.loads(PATTERN_FILE.read_text())
+        progs = data.get("programs") or PROGRAMS
+    except Exception:
+        progs = PROGRAMS
+    return progs
+
+def save_custom(name: str, cells, description: str = ""):
+    _ensure_file()
+    try:
+        data = json.loads(PATTERN_FILE.read_text())
+    except Exception:
+        data = {"schema": PATTERN_SCHEMA_VERSION, "presets": PRESET_PATTERNS, "custom": {}, "programs": PROGRAMS}
+    custom = data.get("custom") or {}
+    custom[name] = {"description": (description or "").strip(),
+                    "cells": _sanitize_cells(cells)}
+    data["custom"] = custom
+    # preserve presets + programs from code
+    data["presets"] = PRESET_PATTERNS
+    data["programs"] = PROGRAMS
+    PATTERN_FILE.write_text(json.dumps(data, indent=2))
+
+def delete_custom(name: str) -> bool:
+    _ensure_file()
+    try:
+        data = json.loads(PATTERN_FILE.read_text())
+    except Exception:
+        return False
+    custom = data.get("custom") or {}
+    if name in custom:
+        del custom[name]
+        data["custom"] = custom
+        data["presets"] = PRESET_PATTERNS
+        data["programs"] = PROGRAMS
+        PATTERN_FILE.write_text(json.dumps(data, indent=2))
+        return True
+    return False
+
+def get_spec(name: str):
+    """
+    Look up a SHAPE by user-facing name (presets/custom). Programs are separate.
+    """
+    data = load_all()
+    return data["presets"].get(name) or data["custom"].get(name)
+
+def get_program(key: str):
+    """
+    Look up a PROGRAM by key, e.g., 'CLASSIC', 'HARD_WAYS', 'LUCKY_7', 'SPECIAL_NUMBER', 'ODD_EVEN', etc.
+    """
+    progs = load_programs()
+    return progs.get(str(key).upper())
+```
+
+=== FILE: templates/index.html ===
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>BettyBot – Bingo</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v=3">
+</head>
+<body>
+  <div class="stage">
+
+    <!-- Welcome -->
+    <section class="welcome active" id="view_welcome" aria-labelledby="welcomeTitle">
+      <div>
+        <div class="logo" id="welcomeTitle">BettyBot</div>
+        <button class="start-btn" id="btn_start" aria-label="Start playing Bingo">Let’s Play Bingo!</button>
+        <div class="start-msg">Tap to begin • Voice & on-screen controls available</div>
+      </div>
+    </section>
+
+    <!-- Setup: how many games -->
+    <section class="setup" id="view_setup" aria-labelledby="setupTitle">
+      <div class="title" id="setupTitle">How many games will you be playing tonight?</div>
+      <div class="numgrid" id="numgrid" role="group" aria-label="Choose number of games 1 to 20"></div>
+      <div class="confirm" id="confirm" style="display:none;">
+        <div id="confirmText" aria-live="polite"></div>
+        <div class="pill" role="group" aria-label="Confirm choice">
+          <button class="btn" id="btn_yes">Yes</button>
+          <button class="btn" id="btn_no">No</button>
+        </div>
+        <div class="hint">You can say “Yes” or “No,” or tap a button.</div>
+      </div>
+    </section>
+
+    <!-- Program pick -->
+    <section class="program-pick" id="view_program_pick" aria-labelledby="programPickTitle">
+      <div class="pick-head">
+        <div class="head-title" id="programPickTitle">Pick Games</div>
+        <div class="head-sub" id="programPickSub">Game 1 of N</div>
+      </div>
+      <div class="program-grid" id="programGrid" aria-label="Game types"></div>
+      <div class="pick-actions">
+        <button class="btn primary" id="btn_start_session">Start Session</button>
+      </div>
+    </section>
+
+    <!-- Overview (minimal top) -->
+    <section class="overview" id="view_overview" aria-labelledby="overviewTitle">
+      <div class="toolbar minimal">
+        <div class="grow">
+          <span id="program_name" class="prog-name"></span>
+          <span id="status" class="status-label" aria-live="polite">LISTENING</span>
+        </div>
+        <button class="btn next big" id="btn_next_game">Game Ended → Next</button>
+        <button class="fab-gear" id="gearBtn" aria-label="Open settings">⚙️</button>
+      </div>
+      <div class="cards cols-3" id="cards" aria-label="Bingo cards"></div>
+    </section>
+
+    <!-- Focus -->
+    <section class="focus" id="view_focus" aria-labelledby="focusTitle">
+      <div class="focus-head">
+        <button class="back" id="btn_back" aria-label="Back to all cards">← Back</button>
+        <div class="focus-title" id="focusTitle">Sheet · Card 1</div>
+        <div class="status">Status: <span id="status_focus" aria-live="polite">LISTENING</span></div>
+      </div>
+      <div class="focus-grid-wrap">
+        <div class="focus-grid" id="focusGrid" aria-label="Focused bingo card"></div>
+      </div>
+    </section>
+
+    <!-- Heard popup -->
+    <div class="heard-overlay" id="heardOverlay" aria-live="polite" aria-modal="true" role="dialog">
+      <div class="heard-box" role="document">
+        <div class="heard-title">Heard</div>
+        <div class="heard-text" id="heardText">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Drawer -->
+  <div class="drawer-backdrop" id="drawerBackdrop" aria-hidden="true"></div>
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-label="Settings Drawer">
+    <div class="controls">
+      <div class="row">
+        <div style="font-weight:800;">Settings</div>
+        <div class="status">Status: <span id="status_drawer" aria-live="polite">LISTENING</span></div>
+      </div>
+
+      <!-- Mic Gain -->
+      <div class="row gain">
+        <label for="gainSlider">Mic Gain</label>
+        <button class="btn" onclick="bumpGain(-0.2)" aria-label="Decrease mic gain">−</button>
+        <input id="gainSlider" type="range" min="0.5" max="6.0" step="0.1"
+               oninput="gainLive(this.value)" onchange="gainSet(this.value)"/>
+        <button class="btn" onclick="bumpGain(0.2)" aria-label="Increase mic gain">+</button>
+        <span class="val" id="gainVal">3.0</span>
+      </div>
+
+      <!-- Speaker Volume -->
+      <div class="row speaker">
+        <label for="speakerSlider">Speaker</label>
+        <button class="btn" onclick="bumpSpeaker(-5)" aria-label="Decrease speaker volume">−</button>
+        <input id="speakerSlider" type="range" min="0" max="100" step="1"
+               oninput="speakerLive(this.value)" onchange="speakerSet(this.value)"/>
+        <button class="btn" onclick="bumpSpeaker(5)" aria-label="Increase speaker volume">+</button>
+        <span class="val" id="speakerVal">—</span>
+      </div>
+
+      <!-- Advanced controls moved here -->
+      <div class="row" role="group" aria-label="Card and call controls">
+        <button class="btn" onclick="newSheet()">New Cards</button>
+        <button class="btn" onclick="simulate()">Simulate Call</button>
+        <button class="btn" onclick="repeatLast()">Repeat</button>
+        <button class="btn" id="modeBtn_drawer" aria-pressed="false" onclick="toggleMode()">Mode: Play</button>
+      </div>
+
+      <div class="row">
+        <button class="btn" onclick="closeDrawer()">Close</button>
+      </div>
+    </div>
+  </aside>
+
+  <script src="{{ url_for('static', filename='app.js') }}?v=3" defer></script>
+</body>
+</html>
+```
+
+=== FILE: static/app.css ===
+```css
+/* ========== Theme Tokens ========== */
+:root{
+  --bg:#0b0e14;            /* app background */
+  --ink:#eaf2ff;           /* primary text */
+  --panel:#0f1420;         /* surfaces / panels */
+  --border:#253047;        /* panel borders */
+  --accent:#9acbff;        /* UI accents */
+  --green:#16a34a;         /* start / confirm */
+  --muted:#9aa7ba;         /* subtle text */
+}
+
+/* ========== Resets + Base ========== */
+*{ box-sizing: border-box; -webkit-user-select:none; user-select:none; }
+html,body{ margin:0; padding:0; height:100%; background:var(--bg); color:var(--ink);
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+button{ font-family: inherit; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+img{ max-width:100%; height:auto; display:block; }
+
+/* Utility */
+.hidden{ display:none !important; }
+.visually-hidden{ position:absolute !important; width:1px; height:1px; margin:-1px; padding:0; border:0; clip:rect(0 0 0 0); overflow:hidden; }
+
+/* ========== Global Header / Back ========== */
+.global-header{
+  position: fixed; top:10px; left:10px; z-index:100;
+}
+.btn-back{
+  background:#1a2233; border:1px solid #2b3950; color:#9acbff;
+  padding:10px 14px; border-radius:12px; font-weight:700; font-size:16px;
+  box-shadow:0 4px 12px rgba(0,0,0,0.3);
+}
+.btn-back:active{ transform: translateY(1px); }
+
+/* ========== App Stage / Views ========== */
+.stage{ position:fixed; inset:0; display:flex; flex-direction:column; }
+.welcome,.setup,.overview,.focus{ flex:1; display:none; }
+.active{ display:flex; }
+
+/* ========== Welcome (5" touch optimized) ========== */
+.welcome{
+  align-items:center; justify-content:center; padding:16px; text-align:center;
+}
+.logo{
+  font-size:clamp(28px,6.5vw,42px); font-weight:900; letter-spacing:1px;
+  margin-bottom:14px; color:var(--accent);
+}
+.start-btn{
+  background:var(--green); color:#fff; border:none;
+  padding:clamp(18px,4vh,26px) clamp(22px,6vw,34px);
+  font-size:clamp(22px,6vw,32px); font-weight:900; border-radius:18px;
+  min-width:72vw; min-height:12vh;
+  box-shadow:0 8px 30px rgba(0,0,0,0.35);
+  animation:pulse 1200ms ease-in-out infinite;
+}
+.start-msg{ margin-top:10px; font-size:clamp(14px,3.5vw,16px); opacity:.8; }
+@keyframes pulse{ 0%{transform:scale(1)} 50%{transform:scale(1.04)} 100%{transform:scale(1)} }
+
+/* ========== Setup (How many games?) ========== */
+.setup{ flex-direction:column; padding:18px; gap:16px; }
+.setup .title{ font-size:28px; font-weight:800; text-align:center; }
+.numgrid{
+  display:grid; grid-template-columns:repeat(5,1fr); gap:10px;
+  margin:6px auto 0; width:min(680px,92vw);
+}
+.numgrid button{
+  background:#1a2233; color:#eaf2ff; border:1px solid #2b3950; border-radius:12px;
+  padding:14px 0; font-size:20px; font-weight:800;
+}
+.confirm{ text-align:center; margin-top:8px; font-size:18px; }
+.confirm .pill{ display:inline-flex; gap:10px; margin-top:8px; }
+.pill .btn{ background:#111827; border:1px solid #334155; padding:10px 14px; border-radius:999px; font-weight:700; }
+.hint{ text-align:center; opacity:.75; margin-top:6px; font-size:14px; }
+
+/* ========== Overview (multi-card) ========== */
+.overview{ flex-direction:column; min-height:0; }
+.toolbar{
+  display:flex; gap:8px; align-items:center; padding:10px;
+  border-bottom:1px solid var(--border); background:var(--panel);
+}
+.toolbar .btn{
+  background:#1a2233; border:1px solid #2b3950; color:#eaf;
+  padding:10px 12px; border-radius:12px;
+}
+.toolbar .btn:active{ transform:translateY(1px); }
+.grow{ margin-left:auto; color:#9acbff; font-size:14px; }
+
+.cards{
+  flex:1; min-height:0; padding:10px; display:grid; gap:10px;
+}
+.cards.cols-1{ grid-template-columns:repeat(1,1fr); }
+.cards.cols-2{ grid-template-columns:repeat(2,1fr); }
+.cards.cols-3{ grid-template-columns:repeat(3,1fr); }
+.cards.cols-4{ grid-template-columns:repeat(3,1fr); }
+.cards.cols-5,.cards.cols-6{ grid-template-columns:repeat(3,1fr); }
+
+.mini{
+  background:#0b1324; border:1px solid #2b3950; border-radius:14px;
+  padding:10px; display:flex; flex-direction:column;
+}
+.mini h4{ margin:0 0 6px 0; font-size:14px; color:#9acbff; }
+.mini .grid{ display:grid; grid-template-columns:repeat(5,1fr); gap:6px; }
+.tap{ margin-top:8px; font-size:12px; opacity:.7; }
+
+/* Cells */
+.cell{
+  background:#111827; border:1px solid #293241; border-radius:10px;
+  min-height:48px; display:flex; align-items:center; justify-content:center;
+  font-size:18px;
+}
+.hdr{ font-weight:900; font-size:18px; background:#161f2f; color:#9acbff; }
+.cell.free{ color:#0f0; border-color:#365a36; }
+.cell.marked{
+  background:#284a2b; border-color:#5fa463; color:#eaffea;
+  box-shadow: inset 0 0 0 3px #6fd97a66;
+}
+
+/* ========== Focus (single card fullscreen) ========== */
+.focus{ flex-direction:column; min-height:0; }
+.focus-head{
+  display:flex; align-items:center; gap:10px; padding:10px;
+  border-bottom:1px solid var(--border); background:#0f1420;
+}
+.back{
+  background:#1a2233; border:1px solid #2b3950; color:#eaf;
+  padding:10px 12px; border-radius:12px;
+}
+.focus-title{ font-weight:800; }
+.focus-grid-wrap{ flex:1; min-height:0; display:flex; align-items:center; justify-content:center; padding:10px; }
+.focus-grid{ width:min(92vw,680px); display:grid; grid-template-columns:repeat(5,1fr); gap:8px; }
+.focus-grid .cell{ min-height:10.6vh; font-size:3.6vh; }
+
+/* ========== Heard overlay ========== */
+.heard-overlay{
+  position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+  background:rgba(0,0,0,0.55); z-index:20;
+}
+.heard-overlay.show{ display:flex; animation:fadeIn 120ms ease-out; }
+.heard-box{
+  max-width:90vw; padding:18px 26px; background:#0f1420;
+  border:2px solid #2b3950; border-radius:16px; box-shadow:0 8px 40px rgba(0,0,0,0.45);
+  color:#eaf2ff; text-align:center;
+}
+.heard-title{ font-size:18px; color:#9acbff; margin-bottom:6px; opacity:.9; }
+.heard-text{ font-size:42px; font-weight:800; letter-spacing:1px; }
+@keyframes fadeIn{ from{opacity:0} to{opacity:1} }
+
+/* ========== Drawer / Settings ========== */
+.drawer-backdrop{
+  position:fixed; inset:0; background:rgba(0,0,0,0.45);
+  opacity:0; pointer-events:none; transition:opacity .18s ease; z-index:30;
+}
+.drawer{
+  position:fixed; top:0; right:0; height:100vh; width:320px; max-width:90vw;
+  background:var(--panel); border-left:1px solid var(--border);
+  transform:translateX(100%); transition:transform .22s cubic-bezier(.2,.9,.2,1);
+  z-index:31; display:flex; flex-direction:column;
+}
+.drawer.open{ transform:translateX(0); }
+.drawer-backdrop.show{ opacity:1; pointer-events:auto; }
+
+.controls{ display:flex; flex-direction:column; gap:10px; padding:12px; }
+.row{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.btn{
+  background:#1a2233; border:1px solid #2b3950; color:#eaf;
+  padding:10px 12px; border-radius:12px; font-size:16px;
+}
+.btn:active{ transform:translateY(1px); }
+.status{ margin-left:auto; font-size:18px; color:#9fd; }
+
+/* Mic Gain row */
+.gain{
+  display:flex; align-items:center; gap:8px;
+  background:#121a2a; border:1px solid #2b3950; padding:8px 10px; border-radius:12px;
+}
+.gain label{ font-size:14px; color:#9acbff; }
+.gain .val{ width:3.2em; text-align:right; font-variant-numeric: tabular-nums; }
+
+/* Speaker row */
+.row.speaker{
+  display:flex; gap:8px; align-items:center;
+  background:#121a2a; border:1px solid #2b3950; padding:8px 10px; border-radius:12px;
+}
+.row.speaker label{ font-size:14px; color:#9acbff; }
+.row .val{ width:3.6em; text-align:right; font-variant-numeric: tabular-nums; }
+
+/* Range inputs */
+input[type=range]{ width:180px; height:28px; }
+
+/* ========== Floating Gear (open settings) ========== */
+.fab-gear{
+  position:fixed; right:12px; bottom:12px; z-index:50;
+  background:#1a2233; border:1px solid #2b3950; color:#9acbff;
+  width:56px; height:56px; border-radius:999px; font-size:24px;
+  display:grid; place-items:center; box-shadow:0 6px 22px rgba(0,0,0,0.35);
+}
+.fab-gear:active{ transform:translateY(1px); }
+
+/* ========== Misc touch niceties ========== */
+@media (hover:none){
+  .btn, .start-btn, .back, .btn-back, .fab-gear{ -webkit-tap-highlight-color: transparent; }
+}
+
+/* Optional: scroll behavior if content overflows small screens */
+@supports (overflow: overlay){
+  .drawer{ overflow-y:auto; }
+}
+
+/* =====================================================
+   ADDITIONS for Program Pick + Minimal Toolbar
+   (Everything above is your original; nothing removed)
+   ===================================================== */
+
+/* Program pick */
+.program-pick{ flex-direction:column; padding:12px; gap:12px; display:none; }
+.program-pick.active{ display:flex; }
+.pick-head{ display:flex; align-items:baseline; gap:10px; }
+.head-title{ font-weight:900; font-size:22px; }
+.head-sub{ color:var(--muted); }
+.program-grid{ display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+@media(min-width:720px){ .program-grid{ grid-template-columns:repeat(3,1fr);} }
+.program-card{
+  background:#0b1324; border:1px solid #2b3950; border-radius:14px; padding:12px;
+  display:flex; flex-direction:column; gap:8px;
+}
+.program-card .name{ font-weight:800; }
+.program-card .desc{ color:var(--muted); font-size:14px; }
+.program-card .preview{ display:grid; grid-template-columns:repeat(5, 18px); gap:4px; }
+.program-card .dot{ width:18px; height:18px; border:1px solid #293241; border-radius:4px; }
+.program-card .dot.sel{ background:#244466; border-color:#6aa2ff; }
+.program-card .choose{ margin-top:6px; }
+.pick-actions{ display:flex; justify-content:flex-end; }
+.btn.primary{ background:#1a2233; border:2px solid #2b3950; color:#eaf; font-weight:900; border-radius:12px; padding:10px 14px; }
+
+/* Minimal toolbar variant used during play */
+.toolbar.minimal{
+  display:flex; gap:8px; align-items:center; padding:10px;
+  border-bottom:1px solid var(--border); background:var(--panel);
+}
+.prog-name{ font-weight:800; margin-right:10px; }
+.status-label{ color:#9acbff; margin-left:8px; }
+.btn.next.big{
+  background:#1a2233; border:2px solid #2b3950; color:#eaf; font-weight:900;
+  padding:12px 16px; border-radius:14px;
+}
+
+/* In minimal toolbar we place the gear inline */
+.toolbar.minimal .fab-gear{
+  position:static; width:44px; height:44px; border-radius:12px; font-size:20px;
+  box-shadow:none; margin-left:6px;
+}
+```
+
+=== FILE: static/app.js ===
+```javascript
+/* ===== DOM refs ===== */
+const viewWelcome  = document.getElementById('view_welcome');
+const viewSetup    = document.getElementById('view_setup');
+const viewOverview = document.getElementById('view_overview');
+const viewFocus    = document.getElementById('view_focus');
+
+const btnStart   = document.getElementById('btn_start');
+const numgrid    = document.getElementById('numgrid');
+const confirmBox = document.getElementById('confirm');
+const confirmText= document.getElementById('confirmText');
+const btnYes     = document.getElementById('btn_yes');
+const btnNo      = document.getElementById('btn_no');
+
+const cardsEl    = document.getElementById('cards');
+const focusGrid  = document.getElementById('focusGrid');
+const focusTitle = document.getElementById('focusTitle');
+
+const statusEl         = document.getElementById('status');
+const statusElFocus    = document.getElementById('status_focus');
+const statusElDrawer   = document.getElementById('status_drawer');
+
+const modeBtn          = document.getElementById('modeBtn');
+const modeBtnDrawer    = document.getElementById('modeBtn_drawer');
+
+const heardOverlay = document.getElementById('heardOverlay');
+const heardText    = document.getElementById('heardText');
+
+const globalBackBtn = document.getElementById('btn_global_back');
+
+const drawer   = document.getElementById('drawer');
+const backdrop = document.getElementById('drawerBackdrop');
+const gearBtn  = document.getElementById('gearBtn');
+
+const gainSlider    = document.getElementById('gainSlider');
+const gainVal       = document.getElementById('gainVal');
+const speakerSlider = document.getElementById('speakerSlider');
+const speakerVal    = document.getElementById('speakerVal');
+
+/* ===== App state ===== */
+let state = null;
+let pendingGames = null;
+let drawerOpen = false;
+
+/* ===== Drawer controls ===== */
+function openDrawer(){
+  drawer.classList.add('open');
+  backdrop.classList.add('show');
+  drawer.setAttribute('aria-hidden','false');
+  drawerOpen = true;
+}
+function closeDrawer(){
+  drawer.classList.remove('open');
+  backdrop.classList.remove('show');
+  drawer.setAttribute('aria-hidden','true');
+  drawerOpen = false;
+}
+if (gearBtn) gearBtn.addEventListener('click', openDrawer);
+backdrop.addEventListener('click', closeDrawer);
+
+/* ===== View switching + Back button behavior ===== */
+function setView(name){
+  [viewWelcome, viewSetup, viewOverview, viewFocus].forEach(el=> el.classList.remove('active'));
+  if(name==='WELCOME') viewWelcome.classList.add('active');
+  if(name==='SETUP_GAMES') viewSetup.classList.add('active');
+  if(name==='OVERVIEW') viewOverview.classList.add('active');
+  if(name==='FOCUS') viewFocus.classList.add('active');
+
+  // Toggle global back
+  if (name === 'WELCOME') {
+    globalBackBtn.classList.add('hidden');
+  } else {
+    globalBackBtn.classList.remove('hidden');
+  }
+
+  // Attach per-view back handling
+  globalBackBtn.onclick = () => {
+    if (name === 'SETUP_GAMES') {
+      setView('WELCOME');
+    } else if (name === 'OVERVIEW') {
+      // Re-run start flow (plays jingle + asks again)
+      fetch('/api/start', {method:'POST'});
+    } else if (name === 'FOCUS') {
+      focusNone();
+    }
+  };
+}
+
+/* ===== Toolbar buttons (Overview) ===== */
+document.getElementById('btn_new_sheet').onclick = ()=> newSheet();
+document.getElementById('btn_three').onclick     = ()=> setSheetN(3);
+document.getElementById('btn_six').onclick       = ()=> setSheetN(6);
+document.getElementById('btn_sim').onclick       = ()=> simulate();
+document.getElementById('btn_repeat').onclick    = ()=> repeatLast();
+document.getElementById('btn_back').onclick      = ()=> focusNone();
+
+modeBtn.onclick       = ()=> toggleMode();
+modeBtnDrawer.onclick = ()=> toggleMode();
+
+/* ===== Start flow ===== */
+if (btnStart) {
+  btnStart.onclick = async ()=>{ await fetch('/api/start', {method:'POST'}); };
+}
+
+/* Build 1..20 number buttons */
+(function buildNumGrid(){
+  if (!numgrid) return;
+  for(let i=1;i<=20;i++){
+    const b = document.createElement('button');
+    b.textContent = String(i);
+    b.onclick = ()=> chooseGames(i);
+    numgrid.appendChild(b);
+  }
+})();
+function chooseGames(n){
+  pendingGames = n;
+  confirmText.textContent = `You picked ${n} game${n>1?'s':''}. Is that right?`;
+  confirmBox.style.display = '';
+  say(`You picked ${n} games. Is that right?`);
+}
+btnYes.onclick = async ()=>{
+  if(pendingGames==null) return;
+  await fetch('/api/set_session_games', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({count: pendingGames})
+  });
+  pendingGames = null;
+  confirmBox.style.display = 'none';
+};
+btnNo.onclick = ()=>{
+  pendingGames = null;
+  confirmBox.style.display = 'none';
+  say('Okay, how many games will you be playing?');
+};
+
+/* ===== Gain (mic input) ===== */
+function gainLive(v){ if(gainVal) gainVal.textContent = Number(v).toFixed(1); }
+async function gainSet(v){
+  try{
+    const r = await fetch('/api/gain', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({gain: Number(v)})
+    });
+    const data = await r.json();
+    if(data && typeof data.gain === 'number'){
+      gainSlider.value = data.gain.toFixed(1);
+      gainVal.textContent = data.gain.toFixed(1);
+    }
+  }catch(e){}
+}
+function bumpGain(delta){
+  const cur = Number(gainSlider.value || 3.0);
+  const next = Math.min(6.0, Math.max(0.5, cur + delta));
+  gainSlider.value = next.toFixed(1);
+  gainLive(next);
+  gainSet(next);
+}
+window.gainLive = gainLive;
+window.gainSet  = gainSet;
+window.bumpGain = bumpGain;
+
+/* ===== Speaker volume (hardware, amixer) ===== */
+function speakerLive(v){ if(speakerVal) speakerVal.textContent = `${Math.round(Number(v))}%`; }
+async function speakerSet(v){
+  try{
+    const r = await fetch('/api/volume/speaker', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({speaker: Math.round(Number(v))})
+    });
+    const data = await r.json();
+    if (data && typeof data.speaker === 'number'){
+      speakerSlider.value = data.speaker;
+      speakerVal.textContent = `${data.speaker}%`;
+    }
+  }catch(e){}
+}
+function bumpSpeaker(delta){
+  const cur = Number(speakerSlider.value || 0);
+  const next = Math.min(100, Math.max(0, cur + delta));
+  speakerSlider.value = next;
+  speakerLive(next);
+  speakerSet(next);
+}
+window.speakerLive = speakerLive;
+window.speakerSet  = speakerSet;
+window.bumpSpeaker = bumpSpeaker;
+
+/* ===== API helpers used in buttons ===== */
+async function newSheet(){ await fetch('/api/new_sheet', {method:'POST'}); }
+async function setSheetN(n){
+  await fetch('/api/set_sheet_n', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({n})
+  });
+}
+async function toggleMode(){
+  const next = (state?.mode || 'PLAY') === 'PLAY' ? 'DEBUG' : 'PLAY';
+  await fetch('/api/mode', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mode: next})
+  });
+}
+function simulate(){
+  const letters = ['B','I','N','G','O'];
+  const L = letters[Math.floor(Math.random()*5)];
+  const ranges = {B:[1,15], I:[16,30], N:[31,45], G:[46,60], O:[61,75]};
+  const a=ranges[L][0], b=ranges[L][1];
+  const n = Math.floor(Math.random()*(b-a+1))+a;
+  fetch('/api/sim_call', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({letter:L, number:n})});
+}
+function repeatLast(){ fetch('/api/repeat', {method:'POST'}); }
+function say(t){
+  fetch('/api/say', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: String(t)})});
+}
+window.newSheet = newSheet;
+window.simulate = simulate;
+window.repeatLast = repeatLast;
+window.toggleMode = toggleMode;
+window.closeDrawer = closeDrawer;
+
+/* ===== Focus helpers ===== */
+async function focusCard(idx){
+  await fetch('/api/focus', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({index: idx})});
+}
+async function focusNone(){
+  await fetch('/api/focus', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({index: -1})});
+}
+
+/* ===== Renderers ===== */
+function renderCardsOverview(){
+  const n = (state?.cards || []).length;
+  cardsEl.className = 'cards ' + 'cols-' + Math.min(n,6);
+  cardsEl.innerHTML = '';
+  (state.cards || []).forEach((card, idx)=>{
+    const wrap = document.createElement('div');
+    wrap.className = 'mini';
+
+    const title = document.createElement('h4');
+    title.textContent = `Card ${idx+1}`;
+    wrap.appendChild(title);
+
+    const grid = document.createElement('div');
+    grid.className = 'grid';
+
+    const letters = ['B','I','N','G','O'];
+    for(let i=0;i<5;i++){
+      const h = document.createElement('div');
+      h.className='cell hdr';
+      h.textContent = letters[i];
+      grid.appendChild(h);
+    }
+    for(let r=0;r<5;r++){
+      for(let c=0;c<5;c++){
+        const L = letters[c];
+        const num = card.cols[L][r];
+        const el = document.createElement('div');
+        el.className='cell';
+        if(L==='N' && r===2){
+          el.textContent='FREE';
+          el.classList.add('free');
+          if(card.marks['FREE']) el.classList.add('marked');
+        }else{
+          el.textContent=num;
+          if(card.marks[L+num]) el.classList.add('marked');
+        }
+        grid.appendChild(el);
+      }
+    }
+    const tap = document.createElement('div');
+    tap.className='tap';
+    tap.textContent = 'Tap to view full screen';
+
+    wrap.appendChild(grid);
+    wrap.appendChild(tap);
+    wrap.onclick = ()=> focusCard(idx);
+
+    cardsEl.appendChild(wrap);
+  });
+}
+
+function renderFocus(){
+  const idx = state.focus_idx ?? 0;
+  const card = (state.cards || [])[idx];
+  focusTitle.textContent = `Sheet · Card ${idx+1}`;
+  focusGrid.innerHTML = '';
+
+  const letters = ['B','I','N','G','O'];
+  for(let i=0;i<5;i++){
+    const h = document.createElement('div');
+    h.className='cell hdr';
+    h.textContent=letters[i];
+    focusGrid.appendChild(h);
+  }
+  for(let r=0;r<5;r++){
+    for(let c=0;c<5;c++){
+      const L = letters[c];
+      const num = card.cols[L][r];
+      const el = document.createElement('div');
+      el.className='cell';
+      if(L==='N' && r===2){
+        el.textContent='FREE';
+        el.classList.add('free');
+        if(card.marks['FREE']) el.classList.add('marked');
+      }else{
+        el.textContent=num;
+        if(card.marks[L+num]) el.classList.add('marked');
+      }
+      focusGrid.appendChild(el);
+    }
+  }
+}
+
+function applyModeUI(){
+  const mode = (state?.mode || 'PLAY').toUpperCase();
+  const text = `Mode: ${mode==='PLAY'?'Play':'Debug'}`;
+  modeBtn.textContent = text;
+  modeBtnDrawer.textContent = text;
+  modeBtn.setAttribute('aria-pressed', String(mode!=='PLAY'));
+  modeBtnDrawer.setAttribute('aria-pressed', String(mode!=='PLAY'));
+}
+
+function render(){
+  if(!state) return;
+
+  // Status labels
+  const st = state.status || 'LISTENING';
+  statusEl.textContent = st;
+  statusElFocus.textContent = st;
+  statusElDrawer.textContent = st;
+
+  // Sliders
+  gainSlider.value = (state.gain ?? 3.0).toFixed(1);
+  gainVal.textContent = Number(gainSlider.value).toFixed(1);
+
+  if (typeof state.speaker === 'number' && state.speaker >= 0) {
+    speakerSlider.value = state.speaker;
+    speakerVal.textContent = `${state.speaker}%`;
+  }
+
+  // Mode buttons
+  applyModeUI();
+
+  // View
+  setView(state.view || 'WELCOME');
+
+  if(state.view === 'OVERVIEW') renderCardsOverview();
+  else if(state.view === 'FOCUS') renderFocus();
+}
+
+/* ===== Heard overlay ===== */
+function showHeardOverlay(text, ms=1100){
+  heardText.textContent = text || '—';
+  heardOverlay.classList.add('show');
+  clearTimeout(showHeardOverlay._t);
+  showHeardOverlay._t = setTimeout(()=> heardOverlay.classList.remove('show'), ms);
+}
+
+/* ===== WebSocket ===== */
+const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws');
+ws.onmessage = (e)=>{
+  const msg = JSON.parse(e.data);
+
+  if(msg.type==='STATE'){
+    state = msg.state;
+    render();
+  }
+
+  if(msg.type==='CALL'){
+    state = msg.state;
+    render();
+    if((state.mode||'PLAY')==='PLAY' && msg.call){
+      const L = msg.call[0], n = msg.call.slice(1);
+      showHeardOverlay(`${L} ${n}`);
+    }
+  }
+
+  if(msg.type==='STATUS'){
+    if(state){ state.status = msg.status; render(); }
+  }
+
+  if(msg.type==='HEARD' && msg.raw){
+    if((state?.mode||'PLAY')==='PLAY'){ showHeardOverlay(String(msg.raw)); }
+  }
+
+  if(msg.type==='CONFIG' && msg.key==='gain'){
+    gainSlider.value = Number(msg.value).toFixed(1);
+    gainVal.textContent = Number(msg.value).toFixed(1);
+  }
+
+  if(msg.type==='CONFIG' && msg.key==='speaker'){
+    speakerSlider.value = Number(msg.value);
+    speakerVal.textContent = `${Number(msg.value)}%`;
+  }
+};
+
+/* ===== Initial load ===== */
+(async function init(){
+  try {
+    const r = await fetch('/api/state');
+    state = await r.json();
+  } catch (e) {
+    state = null;
+  }
+  render();
+})();
+```
