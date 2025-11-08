@@ -18,3 +18,5 @@ tmp/
 whisper.cpp/models/
 EOF
 whisper.cpp
+export_code.py
+export_code_snapshot.txt
