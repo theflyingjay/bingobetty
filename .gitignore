@@ -17,3 +17,4 @@ tmp/
 *.bin
 whisper.cpp/models/
 EOF
+whisper.cpp
